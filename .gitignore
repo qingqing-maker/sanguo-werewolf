@@ -1,0 +1,31 @@
+# Secrets: never commit local or production credentials.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Dependencies and build output.
+node_modules/
+dist/
+coverage/
+
+# Runtime state: contains usage ledgers, game logs and generated audio.
+runs/
+game-logs/
+audio-cache/
+*.log
+*.pid
+
+# Large local media is intentionally kept outside the deployable source repo.
+三国狼人杀短片素材/
+
+# Local editor/agent state.
+.claude/
+.zcode/
+.vscode/
+.idea/
+
+# OS files.
+.DS_Store
+Thumbs.db
+Desktop.ini

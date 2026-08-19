@@ -1,0 +1,51 @@
+services:
+  - type: web
+    name: sanguo-werewolf
+    runtime: docker
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    disk:
+      name: sanguo-werewolf-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: DATA_DIR
+        value: /var/data
+      - key: EVENT_LOG_DIR
+        value: /var/data/game-logs
+      - key: LLM_PROVIDER
+        value: volcengine
+      - key: LLM_BASE_URL
+        value: https://ark.cn-beijing.volces.com/api/v3
+      - key: LLM_MODEL_ID
+        value: doubao-seed-2-1-turbo-260628
+      - key: LLM_API_STYLE
+        value: responses
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_TOKEN_BUDGET
+        value: "450000"
+      - key: LLM_CALL_BUDGET
+        value: "500"
+      - key: LLM_BUDGET_LEDGER_PATH
+        value: /var/data/runs/llm-budget-doubao-seed-2-1-turbo-260628-production-v1.jsonl
+      - key: LLM_BUDGET_PERIOD
+        value: doubao-seed-2-1-turbo-260628-production-v1
+      - key: LLM_FALLBACK_STRATEGY
+        value: none
+      - key: LLM_TIMEOUT_MS
+        value: "60000"
+      - key: LLM_MAX_RETRIES
+        value: "2"
+      - key: TTS_PROVIDER
+        value: edge
+      - key: FAST_MODE
+        value: "0"
+      - key: PACING_SCALE
+        value: "1"

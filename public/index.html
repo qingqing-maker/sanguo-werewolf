@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>三国狼人杀 - 多智能体对战</title>
+  <meta name="description" content="基于三国演义人物的 AI 多智能体狼人杀游戏">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 顶部横幅 -->
+    <header class="header">
+      <div class="header-content">
+        <h1 class="title">⚔️ 三国狼人杀</h1>
+        <div class="header-controls">
+          <span class="phase-badge" id="phaseBadge">等待开始</span>
+          <span class="round-info" id="roundInfo"></span>
+          <span class="difficulty-badge" id="difficultyBadge" style="display:none"></span>
+          <div class="control-btns" id="controlBtns" style="display:none">
+            <button class="btn-ctrl btn-pause" id="btnPause" onclick="pauseGame()">⏸ 暂停</button>
+            <button class="btn-ctrl btn-resume" id="btnResume" onclick="resumeGame()" style="display:none">▶ 继续</button>
+            <button class="btn-ctrl btn-restart" id="btnRestart" onclick="restartGame()" title="停掉当前对局，回欢迎页重新选择难度和模式">🔄 再来一局</button>
+            <button class="btn-ctrl" id="btnTts" onclick="toggleTts()" title="开关语音">🔊 语音</button>
+          </div>
+          <button class="btn-ctrl btn-settings" id="btnSettings" onclick="openSettings()" title="设置" style="display:none">⚙️ 设置</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="main">
+      <!-- 左侧角色面板 -->
+      <aside class="panel-left">
+        <h2 class="panel-title">👥 角色列表</h2>
+        <div class="player-list" id="playerList">
+          <div class="empty-state">等待游戏开始...</div>
+        </div>
+        <div class="model-info" id="modelInfo"></div>
+      </aside>
+
+      <!-- 中央对话区 -->
+      <section class="center-stage">
+        <div class="dialogue-area" id="dialogueArea">
+          <div class="welcome-message" id="welcomePanel">
+            <div class="welcome-icon">🏯</div>
+            <h2>三国狼人杀</h2>
+            <p>十二位三国英雄，暗藏四名细作</p>
+            <p>谁是忠臣？谁是奸贼？一切由 AI 定夺</p>
+            <!-- AI 强度：新手 / 标准 / 高阶，观战与参战两种模式都生效 -->
+            <div class="difficulty-bar" id="aiDifficultyBar">
+              <span class="difficulty-label">AI 强度</span>
+              <div class="difficulty-options">
+                <label class="difficulty-option">
+                  <input type="radio" name="aiDifficulty" value="novice" onchange="setAiDifficulty('novice')">
+                  <span>新手</span>
+                </label>
+                <label class="difficulty-option">
+                  <input type="radio" name="aiDifficulty" value="standard" checked onchange="setAiDifficulty('standard')">
+                  <span>标准</span>
+                </label>
+                <label class="difficulty-option">
+                  <input type="radio" name="aiDifficulty" value="expert" onchange="setAiDifficulty('expert')">
+                  <span>高阶</span>
+                </label>
+              </div>
+              <p class="difficulty-hint" id="difficultyHint">标准：接近普通玩家水平</p>
+            </div>
+            <div class="room-entry" id="roomEntry" style="display:flex; flex-direction:column; align-items:center; gap:10px; margin:14px 0;">
+              <p id="roomStatus" class="difficulty-hint">正在连接服务器…</p>
+              <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+                <button type="button" class="btn-start" id="btnCreateRoom" onclick="createRoom()" style="display:none">
+                  🏠 创建房间
+                </button>
+                <button type="button" class="btn-start btn-back" id="btnCloseRoom" onclick="closeRoom()" style="display:none">
+                  关闭房间
+                </button>
+              </div>
+            </div>
+            <!-- 模式选择：观战（全 AI）或参战（选一个人物加入） -->
+            <div class="mode-select" id="modeSelect" style="display:none">
+              <button class="btn-start" id="btnStart" onclick="startGame()">
+                ⚔️ 开始观战（全 AI）
+              </button>
+              <button class="btn-start btn-join" id="btnJoin" onclick="showCharacterPicker()">
+                🙋 加入游戏
+              </button>
+            </div>
+            <!-- 人物选择网格：点「加入游戏」后展开 -->
+            <div class="character-picker" id="characterPicker" style="display:none">
+              <p class="picker-hint">选择你要扮演的人物（身份随机分配）：</p>
+              <div class="character-grid" id="characterGrid"></div>
+              <button class="btn-start btn-back" onclick="hideCharacterPicker()">← 返回</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 人类玩家操作面板 -->
+        <div class="human-input-panel" id="humanInputPanel" style="display:none">
+          <div class="input-prompt" id="inputPrompt"></div>
+          <div class="input-options" id="inputOptions"></div>
+          <div class="input-text-area" id="inputTextArea" style="display:none">
+            <textarea id="humanTextInput" placeholder="输入你的发言..." rows="3"></textarea>
+            <button class="btn-start" onclick="submitHumanText()">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右侧信息栏 -->
+      <aside class="panel-right">
+        <h2 class="panel-title">📜 事件日志</h2>
+        <div class="event-log" id="eventLog">
+          <div class="log-entry log-system">等待连接服务器...</div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Toast 通知容器（右上角，用于 LLM 欠费/额度受限等提醒） -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <!-- 游戏结束弹窗 -->
+  <div class="modal-overlay" id="gameEndModal" style="display:none">
+    <div class="modal">
+      <div class="modal-header" id="modalHeader">🏆 游戏结束</div>
+      <div class="modal-body" id="modalBody"></div>
+      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
+        <button class="btn-start" onclick="closeModal(); showRestartButton();" style="background:linear-gradient(135deg,#4a90d9,#357abd);">📋 返回复盘</button>
+        <button class="btn-start" onclick="resetToWelcome()">🔄 再来一局</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设置面板 -->
+  <div class="modal-overlay" id="settingsModal" style="display:none">
+    <div class="modal settings-modal">
+      <div class="modal-header">⚙️ 设置</div>
+      <div class="settings-body" id="settingsBody">
+        <div class="settings-group mode-group">
+          <div class="settings-group-title">运行模式</div>
+          <div class="mode-toggle-row">
+            <div class="mode-status">
+              当前：<span id="currentModeLabel" class="mode-label mode-real">加载中…</span>
+            </div>
+            <button type="button" class="btn-mode-toggle" id="btnToggleTestMode" onclick="toggleTestMode()">
+              切换到测试模式
+            </button>
+          </div>
+          <div class="settings-hint">
+            测试模式使用 mock provider，一分钱不花，且自动开启极速节奏。适合验证流程/UI/记忆逻辑；正常模式调用真实 LLM。切换后立即生效并会关闭本面板。
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="settings-group-title">模型与预算</div>
+          <label class="settings-field">
+            <span class="settings-label">模型 ID</span>
+            <input type="text" id="setModelId" class="settings-input" placeholder="doubao-seed-evolving">
+            <span class="settings-hint">换模型自动切换独立预算账本，下一局生效</span>
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">Token 预算上限</span>
+            <input type="number" id="setTokenBudget" class="settings-input" min="1" placeholder="4000000">
+            <span class="settings-hint">本地防超支闸门，下一局生效</span>
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">调用次数上限</span>
+            <input type="number" id="setCallBudget" class="settings-input" min="1" placeholder="1500">
+            <span class="settings-hint">下一局生效</span>
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">Provider fallback 策略</span>
+            <select id="setFallbackStrategy" class="settings-input">
+              <option value="none">none — 禁用（默认）</option>
+              <option value="transient">transient — timeout / parse / empty 时转 Mock</option>
+              <option value="on_error">on_error — 除预算/欠费/认证外转 Mock</option>
+              <option value="on_budget">on_budget — 仅预算耗尽后转 Mock</option>
+            </select>
+            <span class="settings-hint">下一局生效；报告会按 real / mixed / mock 分档，并单列 timeout、budget fallback</span>
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">单次 LLM 超时 (LLM_TIMEOUT_MS)</span>
+            <input type="number" id="setLlmTimeout" class="settings-input" min="5000" max="600000" step="1000" placeholder="60000">
+            <span class="settings-hint">OpenAI/Anthropic 下一局生效，范围 5000-600000ms</span>
+          </label>
+        </div>
+        <div class="settings-group">
+          <div class="settings-group-title">节奏与端口</div>
+          <label class="settings-field">
+            <span class="settings-label">节奏系数 (PACING_SCALE)</span>
+            <input type="number" id="setPacing" class="settings-input" min="0" step="0.1" placeholder="1">
+            <span class="settings-hint">停顿时长倍数，0.5=快一倍，立即生效</span>
+          </label>
+          <label class="settings-field settings-field-inline">
+            <span class="settings-label">极速模式 (FAST_MODE)</span>
+            <input type="checkbox" id="setFastMode" class="settings-checkbox">
+            <span class="settings-hint">所有停顿归零，立即生效</span>
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">端口 (PORT)</span>
+            <input type="number" id="setPort" class="settings-input" min="1" max="65535" placeholder="3000">
+            <span class="settings-hint">修改后需手动重启服务生效</span>
+          </label>
+        </div>
+        <div class="settings-msg" id="settingsMsg"></div>
+      </div>
+      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
+        <button class="btn-start" onclick="saveSettings()">💾 保存</button>
+        <button class="btn-start btn-back" onclick="closeSettings()">← 关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 合规声明弹窗：首次访问强制展示，用户勾选同意后写 localStorage，之后不再弹 -->
+  <div id="complianceModal" class="modal-overlay" style="display:none;">
+    <div class="modal" style="max-width:520px;">
+      <h2 style="margin:0 0 12px 0;">📢 使用声明</h2>
+      <div style="text-align:left; line-height:1.7; font-size:0.9rem; color:var(--text-primary);">
+        <p><strong>关于本游戏：</strong></p>
+        <ul style="padding-left:20px; margin:6px 0 12px 0;">
+          <li>本游戏中除你本人外，<strong style="color:#f39c12;">其余所有角色均为人工智能（AI），并非真人玩家</strong>。</li>
+          <li>AI 角色仅参与狼人杀游戏推理，<strong>不提供情感陪伴、心理疏导或任何游戏外交流</strong>。</li>
+          <li>AI 发言禁止人身攻击、辱骂、地域/性别歧视；如发现不当内容，请立即停止游戏并反馈。</li>
+          <li>本产品仅供娱乐，请理性游玩；<strong>建议成年人使用</strong>。</li>
+          <li>本局对话仅用于当次游戏，<strong>不会私自留存或用于训练模型</strong>。</li>
+        </ul>
+        <label style="display:flex; align-items:center; gap:8px; margin-top:12px; cursor:pointer;">
+          <input type="checkbox" id="complianceAgree" style="width:16px; height:16px; cursor:pointer;">
+          <span>我已阅读并同意上述内容</span>
+        </label>
+      </div>
+      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
+        <button class="btn-start" id="btnComplianceOk" onclick="acceptCompliance()" disabled>进入游戏</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="event-sequence.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
