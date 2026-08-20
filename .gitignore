@@ -19,6 +19,9 @@ audio-cache/
 # Large local media is intentionally kept outside the deployable source repo.
 三国狼人杀短片素材/
 
+# Private project notes kept only in the local workspace.
+GAME_GUIDE_AND_INTERVIEW.md
+
 # Local editor/agent state.
 .claude/
 .zcode/

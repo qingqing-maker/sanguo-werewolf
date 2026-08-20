@@ -161,7 +161,7 @@ WebSocket 使用连接级随机 256-bit token。服务端仅保存 session token
       → 猎人/遗言/警徽 → 胜负检查 → 下一轮
 ```
 
-详细规则以 [RULES.md](./RULES.md) 为准；从系统设计、代码链路和面试角度阅读项目，见 [GAME_GUIDE_AND_INTERVIEW.md](./GAME_GUIDE_AND_INTERVIEW.md)。
+详细规则以 [RULES.md](./RULES.md) 为准。
 
 ## 系统架构
 
@@ -300,6 +300,5 @@ npx ts-node --transpile-only src/sim_report.ts runs/a.jsonl runs/b.jsonl
 
 - [RULES.md](./RULES.md)：当前代码实现对应的完整游戏规则。
 - [TODO.md](./TODO.md)：问题、修复记录、待验证事项和产品边界。
-- [GAME_GUIDE_AND_INTERVIEW.md](./GAME_GUIDE_AND_INTERVIEW.md)：完整玩法、架构讲解、故障排查和面试问答。
 
 > **随机种子兼容性**：游戏随机现采用 RandomSource 子流架构（RNG schema v2）。旧版本相同 seed 的具体局面允许变化；同一新版 algorithm/schema/derivation 指纹下，相同 seed 保证稳定。
