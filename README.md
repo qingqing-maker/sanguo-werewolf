@@ -134,11 +134,11 @@ WebSocket 使用连接级随机 256-bit token。服务端仅保存 session token
 
 - `.gitignore` / `.dockerignore`：排除 `.env`、预算账本、对局日志、生成媒体和本地 Agent 配置。
 - `Dockerfile`：Node 22 多阶段构建，生产容器以非 root 用户运行。
-- `render.yaml`：Render 单实例 Blueprint，绑定 `/var/data` 持久磁盘并通过 `/healthz` 健康检查。
+- `render.yaml`：Render 免费单实例 Blueprint，使用临时 `/var/data` 并通过 `/healthz` 健康检查。
 - `.github/workflows/ci.yml`：构建、离线测试和高危依赖审计。
 - `SECURITY.md` / `DEPLOYMENT.md`：Secret 边界、部署步骤和回滚原则。
 
-当前版本必须保持一个实例，因为房间、主持权、Agent 状态和暂停点都在进程内存中。持久磁盘只保存预算账本与公共事件日志，不能让活动对局跨重启续局。详细步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+当前版本必须保持一个实例，因为房间、主持权、Agent 状态和暂停点都在进程内存中。免费实例没有持久磁盘；预算账本与公共事件日志暂存在容器内，重启或重新部署后可能丢失，也不能让活动对局跨重启续局。详细步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
 ## 规则概览
 

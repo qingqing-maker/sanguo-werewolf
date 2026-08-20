@@ -2,14 +2,10 @@ services:
   - type: web
     name: sanguo-werewolf
     runtime: docker
-    plan: starter
+    plan: free
     numInstances: 1
     healthCheckPath: /healthz
     autoDeployTrigger: commit
-    disk:
-      name: sanguo-werewolf-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
