@@ -135,6 +135,20 @@ async function main(): Promise<void> {
     ]);
   });
 
+  await check('账本路径脱敏同时兼容 Windows 与 POSIX 路径', () => {
+    for (const ledgerPath of [
+      'C:\\Users\\secret\\runs\\llm-budget-safe-model.jsonl',
+      '/home/secret/runs/llm-budget-safe-model.jsonl',
+    ]) {
+      const deps = fakeDependencies();
+      deps.inspectBudget = () => ledgerReport({ ledgerPath });
+      const { meta } = initializeBatch(options(true), deps);
+      if (meta.budget.applicability !== 'real') throw new Error('预算类型错误');
+      assert.equal(meta.budget.ledgerId, 'llm-budget-safe-model.jsonl');
+      assert.equal(JSON.stringify(meta).includes('secret'), false);
+    }
+  });
+
   await check('summary completed 表示全部局号已尝试，不等同于全部成功', () => {
     const deps = fakeDependencies();
     const initialized = initializeBatch(options(false), deps);

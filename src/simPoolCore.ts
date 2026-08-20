@@ -79,6 +79,11 @@ function timestampFilePart(iso: string): string {
   return iso.replace(/[:.]/g, '-');
 }
 
+/** 无论当前 Runner 是 Windows 还是 POSIX，都只保留输入路径末尾的文件名。 */
+function crossPlatformBasename(filePath: string): string {
+  return path.posix.basename(path.win32.basename(filePath));
+}
+
 export function parseSimPoolOptions(
   argv: readonly string[],
   context: { projectRoot: string; nowMs: number; nowIso: string },
@@ -123,7 +128,7 @@ export function budgetFromLedgerReport(report: LedgerReport): SimBudgetApplicabl
   const baseline: SimBudgetSnapshot = { ...report.snapshot };
   return {
     applicability: 'real',
-    ledgerId: path.basename(report.ledgerPath),
+    ledgerId: crossPlatformBasename(report.ledgerPath),
     period: baseline.period,
     tokenBudget: baseline.tokenBudget,
     callBudget: baseline.callBudget,
