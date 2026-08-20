@@ -97,6 +97,25 @@ async function main(): Promise<void> {
   unsubscribeResumed();
   unsubscribe();
 
+  const presentationEngine = new GameEngine(RoleRegistry.getDefaultConfig(), new MockProvider(), {
+    idFactory: () => 'presentation-game',
+    eventBus: new EventBus(),
+    presentationAckEnabled: true,
+  });
+  presentationEngine.setPresentationClientAvailable(true);
+  const presented = presentationEngine.waitForSpeechPresentation(9, '测试发言');
+  assert.equal(presentationEngine.getPendingPresentationSequence(), 9);
+  assert.equal(presentationEngine.receiveSpeechPresented('wrong-game', 9), false);
+  assert.equal(presentationEngine.receiveSpeechPresented('presentation-game', 8), false);
+  assert.equal(presentationEngine.receiveSpeechPresented('presentation-game', 9), true);
+  await presented;
+  assert.equal(presentationEngine.getPendingPresentationSequence(), null);
+
+  const cancelledPresentation = presentationEngine.waitForSpeechPresentation(10, '取消中的发言');
+  presentationEngine.cancel();
+  await assert.rejects(cancelledPresentation, /GAME_CANCELLED/);
+  assert.equal(presentationEngine.getPendingPresentationSequence(), null);
+
   const agentEventBus = new EventBus();
   let degradedEvents = 0;
   agentEventBus.on('ai_decision_degraded', () => { degradedEvents++; });

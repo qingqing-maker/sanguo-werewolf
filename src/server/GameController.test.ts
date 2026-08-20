@@ -35,6 +35,9 @@ function createDeferredEngine(id: string): DeferredEngine {
     cancel(): void { fake.cancelled = true; },
     pause(): void { fake.paused = true; },
     resume(): void { fake.paused = false; },
+    setPresentationClientAvailable(): void {},
+    getPendingPresentationSequence: () => null,
+    receiveSpeechPresented: () => false,
   };
   return { engine: fake as GameEngine, get started() { return fake.started; }, get cancelled() { return fake.cancelled; }, resolve: resolveRun };
 }
@@ -67,6 +70,9 @@ function createAbortDrivenEngine(id: string, events: string[]): AbortDrivenEngin
     },
     pause(): void { fake.paused = true; },
     resume(): void { fake.paused = false; },
+    setPresentationClientAvailable(): void {},
+    getPendingPresentationSequence: () => null,
+    receiveSpeechPresented: () => false,
   };
   return {
     engine: fake as GameEngine,

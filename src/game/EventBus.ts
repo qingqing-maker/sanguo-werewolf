@@ -20,7 +20,7 @@ export type AnyEventHandler = (event: GameUIEvent) => void;
 /** 生产核心依赖的最小发布接口。 */
 export interface EventPublisher {
   runWithGameId<T>(gameId: string, fn: () => T): T;
-  emit<K extends GameEventType>(type: K, data: GameEventPayloadMap[K]): void;
+  emit<K extends GameEventType>(type: K, data: GameEventPayloadMap[K]): GameEventOfType<K>;
   getLatestSequence(gameId: string): number;
 }
 
@@ -80,7 +80,7 @@ export class EventBus implements GameEventBus {
   }
 
   /** 发布事件，并统一注入协议版本、时间戳、对局 sequence 和异步上下文中的 gameId。 */
-  emit<K extends GameEventType>(type: K, data: GameEventPayloadMap[K]): void {
+  emit<K extends GameEventType>(type: K, data: GameEventPayloadMap[K]): GameEventOfType<K> {
     const gameId = this.gameContext.getStore();
     const sequence = gameId ? this.getLatestSequence(gameId) + 1 : ++this.unscopedSequence;
     if (gameId) this.latestSequenceByGame.set(gameId, sequence);
@@ -93,7 +93,7 @@ export class EventBus implements GameEventBus {
     } as GameEventOfType<K>;
 
     this.dispatchQueue.push(event as GameUIEvent);
-    if (this.dispatching) return;
+    if (this.dispatching) return event;
     this.dispatching = true;
     try {
       while (this.dispatchQueue.length > 0) {
@@ -107,6 +107,7 @@ export class EventBus implements GameEventBus {
     } finally {
       this.dispatching = false;
     }
+    return event;
   }
 
   /** 移除所有订阅。 */

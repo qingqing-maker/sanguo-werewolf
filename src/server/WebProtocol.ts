@@ -10,6 +10,7 @@ export type ClientCommand =
   | { type: 'start_game'; config?: Record<string, unknown> }
   | { type: 'pause_game' | 'resume_game' | 'cancel_game' }
   | { type: 'restart_game'; config?: Record<string, unknown> }
+  | { type: 'speech_presented'; data: { gameId: string; sequence: number } }
   | { type: 'human_input'; data: { gameId: string; requestId: string; input: Record<string, unknown> } };
 
 export type TransportReasonCode =
@@ -94,6 +95,14 @@ export function decodeClientCommand(value: unknown): ClientCommand | null {
       if (!isPlainObject(data.input)) return null;
       try { if (JSON.stringify(data.input).length > MAX_INPUT_JSON) return null; } catch { return null; }
       return { type: 'human_input', data: { gameId: data.gameId, requestId: data.requestId, input: { ...data.input } } };
+    }
+    case 'speech_presented': {
+      if (!exactKeys(value, ['type', 'data'], ['type', 'data']) || !isPlainObject(value.data)) return null;
+      const data = value.data;
+      if (!exactKeys(data, ['gameId', 'sequence'], ['gameId', 'sequence'])) return null;
+      if (typeof data.gameId !== 'string' || !ID_PATTERN.test(data.gameId)) return null;
+      if (!Number.isSafeInteger(data.sequence) || Number(data.sequence) <= 0) return null;
+      return { type: 'speech_presented', data: { gameId: data.gameId, sequence: Number(data.sequence) } };
     }
     default:
       return null;

@@ -6,7 +6,7 @@ import { PhaseManager } from './PhaseManager';
 import { VoteManager } from './VoteManager';
 import { LLMProvider } from '../llm/LLMProvider';
 import { EventPublisher, globalEventBus } from './EventBus';
-import { scalePacingMs } from './pacing';
+import { estimateSpeechBaseMs, scalePacingMs } from './pacing';
 import { PhaseNode, TransitionSignal, nextPhase } from './PhaseMachine';
 import { randomUUID } from 'node:crypto';
 import { MathRandomSource, RandomSource } from '../random';
@@ -22,6 +22,13 @@ export interface PendingHumanInputSnapshot {
 interface PendingHumanInput extends PendingHumanInputSnapshot {
   validate: (input: unknown) => input is Record<string, unknown>;
   resolve: (input: any) => void;
+  reject: (error: Error) => void;
+}
+
+interface PendingPresentation {
+  readonly sequence: number;
+  readonly timer: NodeJS.Timeout;
+  resolve: () => void;
   reject: (error: Error) => void;
 }
 
@@ -74,6 +81,8 @@ export interface GameEngineOptions {
   /** 对局 ID 属于基础设施标识，不得消耗游戏随机流。 */
   idFactory?: () => string;
   eventBus?: EventPublisher;
+  /** Web 模式由主持人浏览器在文字展示且 TTS 播放结束后回执；CLI/测试默认仍按字数估时。 */
+  presentationAckEnabled?: boolean;
 }
 
 /**
@@ -85,6 +94,9 @@ export class GameEngine {
   private readonly random: RandomSource;
   private readonly sheriffTransferRandom: RandomSource;
   private readonly eventBus: EventPublisher;
+  private readonly presentationAckEnabled: boolean;
+  private presentationClientAvailable = false;
+  private pendingPresentation: PendingPresentation | null = null;
 
   getGameId(): string {
     return this.gameId;
@@ -116,6 +128,7 @@ export class GameEngine {
     this.llm = llm;
     this.random = options.random ?? new MathRandomSource();
     this.eventBus = options.eventBus ?? globalEventBus;
+    this.presentationAckEnabled = options.presentationAckEnabled ?? false;
     this.sheriffTransferRandom = this.random.fork('sheriff-transfer');
     this.gameId = (options.idFactory ?? randomUUID)();
   }
@@ -209,6 +222,12 @@ export class GameEngine {
     const pending = this.pendingHumanInput;
     this.pendingHumanInput = null;
     pending?.reject(new Error('GAME_CANCELLED'));
+    const presentation = this.pendingPresentation;
+    this.pendingPresentation = null;
+    if (presentation) {
+      clearTimeout(presentation.timer);
+      presentation.reject(new Error('GAME_CANCELLED'));
+    }
     // 取消暂停只解除内部阻塞，不发布“游戏继续”这一语义事件。
     if (this._paused) {
       this._paused = false;
@@ -217,6 +236,56 @@ export class GameEngine {
       this._pauseResolve = null;
     }
     console.log('[Engine] 游戏已终止');
+  }
+
+  /**
+   * Web 层通知当前是否有主持人浏览器在线。已经开始等待的发言保留到重连或超时，
+   * 这样短暂断网后主持人仍能恢复并读完当前句；尚未开始的发言在无人在线时按字数估时。
+   */
+  setPresentationClientAvailable(available: boolean): void {
+    this.presentationClientAvailable = available;
+  }
+
+  getPendingPresentationSequence(): number | null {
+    return this.pendingPresentation?.sequence ?? null;
+  }
+
+  receiveSpeechPresented(gameId: string, sequence: number): boolean {
+    const pending = this.pendingPresentation;
+    if (!pending || gameId !== this.gameId || pending.sequence !== sequence) return false;
+    this.pendingPresentation = null;
+    clearTimeout(pending.timer);
+    pending.resolve();
+    return true;
+  }
+
+  /**
+   * 等待主持人完成一条发言的“显示 + 朗读”。无主持人浏览器或未启用 Web 回执时，
+   * 保留原有估时行为；回执超时只作为断线/浏览器异常兜底。
+   */
+  async waitForSpeechPresentation(sequence: number, text: string): Promise<void> {
+    if (!this.presentationAckEnabled || !this.presentationClientAvailable) {
+      await this.delay(estimateSpeechBaseMs(text));
+      return;
+    }
+    if (this.pendingPresentation) throw new Error('PRESENTATION_ALREADY_PENDING');
+
+    const configured = Number.parseInt(process.env.SPEECH_PRESENTATION_TIMEOUT_MS || '', 10);
+    const estimated = 15_000 + Math.round(String(text).replace(/\s+/g, '').length / 2.5 * 1_000);
+    const timeoutMs = Number.isFinite(configured) && configured >= 1_000
+      ? configured
+      : Math.max(20_000, Math.min(estimated, 120_000));
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingPresentation?.sequence !== sequence) return;
+        this.pendingPresentation = null;
+        console.warn(`[Engine] 等待发言播放回执超时，继续流程: sequence=${sequence}`);
+        resolve();
+      }, timeoutMs);
+      this.pendingPresentation = { sequence, timer, resolve, reject };
+    });
+    await this.checkpoint();
   }
 
   /** 返回 pending 的只读深拷贝。 */

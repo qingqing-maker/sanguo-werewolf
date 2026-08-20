@@ -14,6 +14,7 @@ export class GameController {
   private generation = 0;
   private activeRun: Promise<void> | null = null;
   private restartPending = false;
+  private presentationClientAvailable = false;
 
   private readonly engineFactory: GameEngineFactory;
   private readonly eventBus: EventPublisher;
@@ -22,7 +23,7 @@ export class GameController {
     this.eventBus = eventBus;
     this.engineFactory = engineFactory ?? (config => {
       const llm = createLLMProvider(undefined, false, { eventBus });
-      return new GameEngine(config, llm, { eventBus });
+      return new GameEngine(config, llm, { eventBus, presentationAckEnabled: true });
     });
   }
 
@@ -56,6 +57,7 @@ export class GameController {
     const engine = this.engineFactory(gameConfig);
     const generation = ++this.generation;
     this.engine = engine;
+    this.engine.setPresentationClientAvailable(this.presentationClientAvailable);
     this.currentGameId = engine.getGameId();
     this.isRunning = true;
 
@@ -93,6 +95,20 @@ export class GameController {
   handleHumanInput(gameId: string, requestId: string, seatId: string, input: Record<string, unknown>): HumanInputResult {
     if (!this.engine || !this.isRunning) return { accepted: false, reason: 'no_pending_input' };
     return this.engine.receiveHumanInput(gameId, requestId, seatId, input);
+  }
+
+  setPresentationClientAvailable(available: boolean): void {
+    this.presentationClientAvailable = available;
+    this.engine?.setPresentationClientAvailable(available);
+  }
+
+  handleSpeechPresented(gameId: string, sequence: number): boolean {
+    if (!this.engine || !this.isRunning) return false;
+    return this.engine.receiveSpeechPresented(gameId, sequence);
+  }
+
+  getPendingPresentationSequence(): number | null {
+    return this.engine?.getPendingPresentationSequence() ?? null;
   }
 
   getPendingHumanInput(): PendingHumanInputSnapshot | null { return this.engine?.getPendingHumanInput() ?? null; }

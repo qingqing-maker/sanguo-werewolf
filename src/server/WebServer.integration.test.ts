@@ -42,7 +42,11 @@ function replayEvent(type: 'phase_change' | 'human_input_required' | 'player_spe
 class FakeEventLog {
   loadCalls = 0;
   latest: { gameId: string; events: GameUIEvent[] } | null = null;
+  activeEvents: GameUIEvent[] = [];
   record(): void {}
+  loadEvents(gameId: string): GameUIEvent[] {
+    return this.latest?.gameId === gameId ? [...this.latest.events] : [...this.activeEvents];
+  }
   loadLatestEvents(): { gameId: string; events: GameUIEvent[] } | null {
     this.loadCalls++;
     return this.latest;
@@ -81,6 +85,8 @@ class FakeController {
   state: any = { isRunning: false, paused: false, provider: 'mock', model: 'mock', gameId: null, phase: null, round: 0, players: [], aiDifficulty: 'standard', humanCharacterName: null };
   pending: any = null;
   busy = false;
+  presentationAvailable = false;
+  presented: Array<{ gameId: string; sequence: number }> = [];
   startGame(config: any, initialized?: (gameId: string, players: any[]) => void): Promise<void> {
     if (this.busy) throw new Error('GAME_BUSY');
     this.state = {
@@ -108,6 +114,12 @@ class FakeController {
     this.pending = null;
     return { accepted: true, input };
   }
+  setPresentationClientAvailable(available: boolean): void { this.presentationAvailable = available; }
+  handleSpeechPresented(gameId: string, sequence: number): boolean {
+    this.presented.push({ gameId, sequence });
+    return true;
+  }
+  getPendingPresentationSequence(): number | null { return null; }
   pauseGame(): void { this.state.paused = true; }
   resumeGame(): void { this.state.paused = false; }
   cancelGame(): void { this.state.isRunning = false; }
@@ -156,6 +168,13 @@ async function main(): Promise<void> {
   host.ws.send(JSON.stringify({ type: 'start_game', config: { humanCharacterName: '诸葛亮' } }));
   assert.equal((await hostUpdated).data.seatId, 'player_1', '发起连接应收到服务端权威座位');
   assert.equal((await sameHostUpdated).data.seatId, 'player_1', '同 token 连接应同步服务端权威座位');
+  assert.equal(controller.presentationAvailable, true, '主持人连接后应启用浏览器发言回执');
+
+  guest.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 7 } }));
+  assert.equal((await onceMessage(guest.ws)).data.reason, 'forbidden', '非主持人不得伪造播放完成回执');
+  host.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 7 } }));
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(controller.presented.at(-1), { gameId: 'game-test', sequence: 7 });
 
   controller.pending = { gameId: 'game-test', requestId: 'request-1', playerId: 'player_1', prompt: '请选择', options: { targets: ['player_2'] } };
   const hostPrivate = onceMessage(host.ws);

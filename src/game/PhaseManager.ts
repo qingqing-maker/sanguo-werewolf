@@ -3,7 +3,7 @@ import { BaseAgent } from '../agents/BaseAgent';
 import { GameEngine } from './GameEngine';
 import { ALL_ROLES } from '../roles/Role';
 import { EventPublisher, globalEventBus } from './EventBus';
-import { estimateSpeechBaseMs, scalePacingMs } from './pacing';
+import { scalePacingMs } from './pacing';
 import { MathRandomSource, RandomSource } from '../random';
 
 /**
@@ -31,14 +31,6 @@ const SEER_REPEAT_RATE = () => misfireRate('MISFIRE_SEER_REPEAT', 0.12);
 const GUARD_REPEAT_RATE = () => misfireRate('MISFIRE_GUARD_REPEAT', 0.12);
 // 注：狼人自刀已从"失误注入"升格为**合法战术**（见 executeWolfVote：非首夜候选池含自己和同伴），
 // 由狼队投票主动选择，不再随机注入，故原 WOLF_SELFKILL_RATE 常量已删除。
-
-/**
- * 按字数估算发言展示停顿（不含节奏缩放）。
- * 缩放统一交给 delay()，避免 PACING_SCALE 被重复应用。
- */
-function estimateSpeechPacingMs(text: string): number {
-  return estimateSpeechBaseMs(text);
-}
 
 export class PhaseManager {
   private agents: BaseAgent[];
@@ -706,7 +698,7 @@ export class PhaseManager {
       console.log(`  │ 🗣️ [发言] ${speech.publicSpeech}`);
       console.log(`  └${'─'.repeat(45)}`);
 
-      this.eventBus.emit('player_speak', {
+      const speechEvent = this.eventBus.emit('player_speak', {
         playerId: agent.player.id,
         playerName: agent.player.name,
         title: agent.player.characterConfig.title,
@@ -722,7 +714,7 @@ export class PhaseManager {
         }
       }
 
-      await this.delay(estimateSpeechPacingMs(speech.publicSpeech));
+      await this.engine.waitForSpeechPresentation(speechEvent.sequence, speech.publicSpeech);
     }
 
     // === 警长归票发言（所有人发言后、投票前） ===
@@ -751,7 +743,7 @@ export class PhaseManager {
         console.log(`  │ 🗣️ [归票] ${speech.publicSpeech}`);
         console.log(`  └${'─'.repeat(45)}`);
 
-        this.eventBus.emit('sheriff_final_speech', {
+        const speechEvent = this.eventBus.emit('sheriff_final_speech', {
           sheriffId: this.state.sheriffId,
           sheriffName,
           innerThoughts: speech.innerThoughts,
@@ -766,7 +758,7 @@ export class PhaseManager {
           }
         }
 
-        await this.delay(estimateSpeechPacingMs(speech.publicSpeech));
+        await this.engine.waitForSpeechPresentation(speechEvent.sequence, speech.publicSpeech);
       }
     }
   }
@@ -1038,7 +1030,7 @@ export class PhaseManager {
 
       console.log(`  🏅 ${agent.player.name}：${speech.substring(0, 100)}${speech.length > 100 ? '...' : ''}`);
       speechesByCandidate.set(agent.player.id, speech);
-      this.eventBus.emit('sheriff_speech', {
+      const speechEvent = this.eventBus.emit('sheriff_speech', {
         playerId: agent.player.id,
         playerName: agent.player.name,
         speech,
@@ -1051,7 +1043,7 @@ export class PhaseManager {
         }
       }
 
-      await this.delay(estimateSpeechPacingMs(speech));
+      await this.engine.waitForSpeechPresentation(speechEvent.sequence, speech);
     }
 
     // === 3. 退水阶段 ===
@@ -1267,7 +1259,7 @@ ${speechDigest}
 
       console.log(`  🏅 [PK] ${agent.player.name}：${speech.substring(0, 100)}${speech.length > 100 ? '...' : ''}`);
       pkSpeechesByCandidate.set(agent.player.id, speech);
-      this.eventBus.emit('sheriff_pk_speech', {
+      const speechEvent = this.eventBus.emit('sheriff_pk_speech', {
         playerId: agent.player.id,
         playerName: agent.player.name,
         speech,
@@ -1279,7 +1271,7 @@ ${speechDigest}
         }
       }
 
-      await this.delay(estimateSpeechPacingMs(speech));
+      await this.engine.waitForSpeechPresentation(speechEvent.sequence, speech);
     }
 
     // PK投票（仍由警下投票）：把 PK 演说原文喂给下一轮 vote()

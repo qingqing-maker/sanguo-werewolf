@@ -192,7 +192,11 @@ export class WebServer {
         if (!command) { this.sendError(context, 'invalid_message'); return; }
         this.handleClientMessage(context, command);
       });
-      ws.on('close', () => { if (context.authTimer) clearTimeout(context.authTimer); this.clients.delete(context); });
+      ws.on('close', () => {
+        if (context.authTimer) clearTimeout(context.authTimer);
+        this.clients.delete(context);
+        this.syncPresentationAvailability();
+      });
       ws.on('error', () => { /* close 事件负责清理 */ });
     });
   }
@@ -211,6 +215,7 @@ export class WebServer {
           room: this.roomStateFor(session),
           capabilities: this.capabilities(session),
         }));
+        this.syncPresentationAvailability();
         this.broadcastRoomState();
       } else {
         this.send(context, transportEvent('room_create_result', { success: false, reason: result }));
@@ -228,6 +233,7 @@ export class WebServer {
           room: this.roomStateFor(session),
           capabilities: this.capabilities(session),
         }));
+        this.syncPresentationAvailability();
         this.broadcastRoomState();
       } else {
         this.send(context, transportEvent('error', { reason: result }));
@@ -238,6 +244,12 @@ export class WebServer {
       if (!session.seatId || session.gameId !== command.data.gameId) { this.send(context, transportEvent('human_input_result', { accepted: false, reason: 'not_owner' })); return; }
       const result = this.gameController.handleHumanInput(command.data.gameId, command.data.requestId, session.seatId, command.data.input);
       this.send(context, transportEvent('human_input_result', result as unknown as Record<string, unknown>));
+      return;
+    }
+    if (command.type === 'speech_presented') {
+      if (!session.isHost) { this.sendError(context, 'forbidden'); return; }
+      if (session.gameId !== command.data.gameId) { this.sendError(context, 'wrong_game'); return; }
+      this.gameController.handleSpeechPresented(command.data.gameId, command.data.sequence);
       return;
     }
     if (!session.isHost) { this.sendError(context, 'forbidden'); return; }
@@ -260,6 +272,7 @@ export class WebServer {
     const viewer = this.viewerFor(session);
     const privateSnapshot = session.seatId ? this.gameController.getSeatPrivateSnapshot(session.seatId) : null;
     const replay = state.isRunning ? null : this.getPublicReplay();
+    const speechHistory = state.isRunning && state.gameId ? this.getActiveSpeechHistory(state.gameId) : [];
     this.send(context, transportEvent('authenticated', {
       sessionId: session.sessionId,
       isHost: session.isHost,
@@ -272,7 +285,10 @@ export class WebServer {
       stateSequence: state.gameId ? this.eventBus.getLatestSequence(state.gameId) : 0,
       hasReplay: !!replay?.events.length,
       replayGameId: replay?.gameId ?? null,
+      speechHistory,
+      pendingPresentationSequence: this.gameController.getPendingPresentationSequence(),
     }));
+    this.syncPresentationAvailability();
     if (replay?.events.length) {
       this.send(context, transportEvent('replay_start', { gameId: replay.gameId, count: replay.events.length }));
       for (const event of replay.events) this.send(context, event);
@@ -377,6 +393,19 @@ export class WebServer {
   }
   private sendToSession(session: SessionRecord, event: ReturnType<typeof transportEvent>): void {
     for (const context of this.clients) if (context.session === session) this.send(context, event);
+  }
+
+  /** 活动局刷新/新观众进入时，仅补发公开发言历史；历史恢复不重播已完成的 TTS。 */
+  private getActiveSpeechHistory(gameId: string): GameUIEvent[] {
+    const speechTypes = new Set(['player_speak', 'sheriff_speech', 'sheriff_pk_speech', 'sheriff_final_speech']);
+    return this.eventLog.loadEvents(gameId).filter(event => speechTypes.has(event.type));
+  }
+
+  private syncPresentationAvailability(): void {
+    const available = [...this.clients].some(context =>
+      !!context.session?.isHost && context.ws.readyState === WebSocket.OPEN
+    );
+    this.gameController.setPresentationClientAvailable(available);
   }
   private roomStateFor(session: SessionRecord): Record<string, unknown> {
     return {

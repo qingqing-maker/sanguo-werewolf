@@ -126,17 +126,19 @@ function makeHarness() {
   }
 
   class FakeAudio {
-    constructor(url) { this.url = url; this.paused = false; this.played = false; this.listeners = {}; audioInstances.push(this); }
+    constructor(url) { this.url = url; this.paused = false; this.played = false; this.playCount = 0; this.listeners = {}; audioInstances.push(this); }
     addEventListener(type, listener) { this.listeners[type] = listener; }
-    play() { this.played = true; return Promise.resolve(); }
+    play() { this.played = true; this.paused = false; this.playCount++; return Promise.resolve(); }
     pause() { this.paused = true; }
   }
 
   const speechSynthesis = {
-    cancelCount: 0, speakCount: 0, onvoiceschanged: null,
+    cancelCount: 0, speakCount: 0, pauseCount: 0, resumeCount: 0, utterances: [], onvoiceschanged: null,
     getVoices: () => [],
     cancel() { this.cancelCount++; },
-    speak() { this.speakCount++; },
+    pause() { this.pauseCount++; },
+    resume() { this.resumeCount++; },
+    speak(utterance) { this.speakCount++; this.utterances.push(utterance); },
   };
   const context = {
     console: { log() {}, warn() {}, error() {} },
@@ -347,6 +349,58 @@ async function main() {
     assert.equal(h.audioInstances.length, 1, '第一段后端 TTS 应已创建音频播放器');
     h.audioInstances[0].listeners.ended();
     assert.equal(dialogue.children.length, before + 2, '第一段音频结束后才显示第二名角色');
+  });
+
+  await check('主持人只在当前发言 TTS 结束后发送对应 sequence 回执', async () => {
+    const h = makeHarness(); const socket = h.sockets[0]; socket.open();
+    socket.message(authenticated({ isHost: true, state: state('g1', true), stateSequence: 0 }));
+    await flush();
+    h.evaluate('backendTtsAvailable = true');
+    socket.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '等待读完' }, sequence: 4 });
+    await flush(); await flush();
+    assert.equal(socket.sent.some((message) => message.type === 'speech_presented'), false, '播放结束前不得回执');
+    h.audioInstances[0].listeners.ended();
+    assert.deepEqual(socket.sent.at(-1), {
+      type: 'speech_presented',
+      data: { gameId: 'g1', sequence: 4 },
+    });
+  });
+
+  await check('暂停会暂停当前音频，继续后恢复且不会提前回执', async () => {
+    const h = makeHarness(); const socket = h.sockets[0]; socket.open();
+    socket.message(authenticated({ isHost: true, state: state('g1', true), stateSequence: 0 }));
+    await flush();
+    h.evaluate('backendTtsAvailable = true');
+    socket.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '暂停测试' }, sequence: 1 });
+    for (let i = 0; i < 5 && !h.evaluate('currentAudio'); i++) await flush();
+    const audio = h.audioInstances[0];
+    socket.message({ type: 'game_paused', data: { gameId: 'g1' }, sequence: 2 });
+    assert.equal(audio.paused, true, '暂停事件应调用当前 Audio.pause()');
+    assert.equal(socket.sent.some((message) => message.type === 'speech_presented'), false, '暂停时不得把当前发言标记为已播完');
+    socket.message({ type: 'game_resumed', data: { gameId: 'g1' }, sequence: 3 });
+    assert.ok(audio.playCount >= 2, '继续后应恢复当前音频');
+    audio.listeners.ended();
+    assert.equal(socket.sent.at(-1).data.sequence, 1, '恢复后真正 ended 才回执原发言 sequence');
+  });
+
+  await check('活动局恢复只朗读服务端仍在等待的当前发言，其余历史只显示文字', async () => {
+    const h = makeHarness(); const socket = h.sockets[0]; socket.open();
+    const speechHistory = [
+      { type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '已完成' }, sequence: 1 },
+      { type: 'player_speak', data: { gameId: 'g1', playerName: '乙', title: '', publicSpeech: '待完成' }, sequence: 2 },
+    ];
+    socket.message(authenticated({
+      isHost: true,
+      state: state('g1', true),
+      stateSequence: 2,
+      speechHistory,
+      pendingPresentationSequence: 2,
+    }));
+    await flush();
+    assert.equal(h.speechSynthesis.speakCount, 1, '只应朗读仍待回执的第二条');
+    assert.equal(h.document.getElementById('dialogueArea').children.filter((child) => child.className === 'message').length, 2);
+    h.speechSynthesis.utterances[0].onend();
+    assert.equal(socket.sent.at(-1).data.sequence, 2);
   });
 
   await check('replay_start 作废在途 TTS，回放对白静音，结束后实时对白恢复', async () => {

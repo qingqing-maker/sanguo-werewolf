@@ -31,6 +31,7 @@ if (!/^[A-Za-z0-9_-]{43}$/.test(sessionToken || '')) {
   localStorage.setItem('sanguo-session-token', sessionToken);
 }
 let authenticated = false;
+let isHost = false;
 let capabilities = {};
 let roomState = { exists: false, roomId: null, isCreator: false };
 let pendingHumanRequest = null;
@@ -91,6 +92,9 @@ let femaleVoice = null;
 let backendTtsAvailable = false;
 // 当前正在播放的 audio 元素（用于 toggleTts 关闭时立即停）
 let currentAudio = null;
+let currentAudioFallback = null;
+let currentTtsItem = null;
+let ttsResumeWaiters = [];
 
 /**
  * TTS 代次（epoch）令牌。每次"作废所有待播语音"（换局/重开/静音/回放）都自增。
@@ -192,51 +196,120 @@ function notifyTtsQuotaExhausted() {
   try { addLog('后端语音额度已耗尽，已切换为浏览器语音', 'system'); } catch {}
 }
 
-function speakText(text, playerName, showMessage) {
+function sendSpeechPresented(sequence) {
+  if (!isHost || !authenticated || replaying || !currentGameId) return;
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'speech_presented',
+    data: { gameId: currentGameId, sequence },
+  }));
+}
+
+function showTtsItem(item) {
+  if (!item || item.shown) return;
+  item.shown = true;
+  item.showMessage();
+}
+
+function finishTtsItem(item) {
+  if (!item || item.presented) return;
+  item.presented = true;
+  item.onPresented();
+}
+
+function releaseTtsResumeWaiters() {
+  const waiters = ttsResumeWaiters;
+  ttsResumeWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+function waitForTtsResume() {
+  if (!gamePaused) return Promise.resolve();
+  return new Promise(resolve => ttsResumeWaiters.push(resolve));
+}
+
+function pauseTtsPlayback() {
+  if (currentAudio) {
+    try { currentAudio.pause(); } catch {}
+  }
+  try { window.speechSynthesis?.pause?.(); } catch {}
+}
+
+function resumeTtsPlayback() {
+  releaseTtsResumeWaiters();
+  if (currentAudio) {
+    currentAudio.play().catch(() => currentAudioFallback?.());
+  }
+  try { window.speechSynthesis?.resume?.(); } catch {}
+  processQueue();
+}
+
+function speakText(text, playerName, showMessage, sequence) {
   const display = typeof showMessage === 'function' ? showMessage : () => {};
+  const item = {
+    text,
+    playerName,
+    sequence,
+    epoch: ttsEpoch,
+    showMessage: display,
+    onPresented: () => sendSpeechPresented(sequence),
+    shown: false,
+    presented: false,
+  };
   if (!ttsEnabled) {
-    display();
+    showTtsItem(item);
+    finishTtsItem(item);
     return;
   }
   // 回放历史事件时静音：只恢复文字记录，不把整局语音重播一遍。
   if (replaying) {
-    display();
+    showTtsItem(item);
     return;
   }
   // 若后端 TTS 不可用，且浏览器也没有 speechSynthesis，直接跳过
   if (!backendTtsAvailable && !window.speechSynthesis) {
-    display();
+    showTtsItem(item);
+    finishTtsItem(item);
     return;
   }
   // 打上当前代次戳：这句话属于"第 ttsEpoch 代"。换局/静音会递增代次，
   // 届时这条即便还在队列里或正卡在 fetch 途中，也会被识别为过期并丢弃。
   // showMessage 也随语音排队：只有轮到这句话朗读时才把文字插入页面，
   // 因而下一名角色不会在上一名角色尚未读完时提前出现。
-  ttsQueue.push({ text, playerName, epoch: ttsEpoch, showMessage: display });
+  ttsQueue.push(item);
   processQueue();
 }
 
 async function processQueue() {
-  if (ttsSpeaking || ttsQueue.length === 0) return;
+  if (gamePaused || ttsSpeaking || ttsQueue.length === 0) return;
   ttsSpeaking = true;
-  const { text, playerName, epoch, showMessage } = ttsQueue.shift();
+  const item = ttsQueue.shift();
+  const { text, playerName, epoch } = item;
+  currentTtsItem = item;
 
   // 入队时的代次已经过期（换局/静音/回放）→ 整句丢弃。
   // 注意要把 ttsSpeaking 复位，否则队列会永久卡死在"有人在说话"的状态。
   if (epoch !== ttsEpoch) {
     ttsSpeaking = false;
+    currentTtsItem = null;
     return;
   }
 
   // 当前角色的文字与语音同时开始；下一条文字要等 nextTurn() 才会显示。
-  showMessage();
+  showTtsItem(item);
 
   // 只有仍属当代时才驱动下一句。跨代驱动会让上一局的消费链把新一局的队列提前拉起来，
   // 形成两条并发链路（表现为语音重叠、顺序错乱）。
+  let completed = false;
   const nextTurn = () => {
-    if (epoch !== ttsEpoch) return;
+    if (completed || epoch !== ttsEpoch) return;
+    completed = true;
+    finishTtsItem(item);
     ttsSpeaking = false;
     currentAudio = null;
+    currentAudioFallback = null;
+    currentTtsItem = null;
     processQueue();
   };
 
@@ -269,24 +342,41 @@ async function processQueue() {
       if (epoch !== ttsEpoch) return;
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
-      currentAudio = audio;
-      audio.addEventListener('ended', () => { URL.revokeObjectURL(url); nextTurn(); });
-      audio.addEventListener('error', () => {
+      let cleaned = false;
+      let fallbackStarted = false;
+      const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
         URL.revokeObjectURL(url);
+      };
+      const fallback = () => {
+        if (fallbackStarted || epoch !== ttsEpoch) return;
+        fallbackStarted = true;
+        cleanup();
+        try { audio.pause(); audio.src = ''; } catch {}
+        currentAudio = null;
+        currentAudioFallback = null;
+        browserSpeak(text, playerName, epoch, nextTurn);
+      };
+      audio.addEventListener('ended', () => { cleanup(); nextTurn(); });
+      audio.addEventListener('error', () => {
         if (epoch !== ttsEpoch) return;
         console.warn('[TTS] 音频播放失败，回退浏览器 TTS');
-        browserSpeak(text, playerName, epoch, nextTurn);
+        fallback();
       });
+      await waitForTtsResume();
+      if (epoch !== ttsEpoch) { cleanup(); return; }
+      currentAudio = audio;
+      currentAudioFallback = fallback;
       await audio.play().catch(() => {
-        URL.revokeObjectURL(url);
         if (epoch !== ttsEpoch) return;
         console.warn('[TTS] 音频 play 被拒（可能未交互），回退');
-        browserSpeak(text, playerName, epoch, nextTurn);
+        fallback();
       });
       // play() 成功后仍可能已换局（await 之后）：立刻停掉，别让上一局的声音漏出来。
       if (epoch !== ttsEpoch) {
         try { audio.pause(); audio.src = ''; } catch {}
-        URL.revokeObjectURL(url);
+        cleanup();
       }
       return;
     } catch (e) {
@@ -303,19 +393,22 @@ async function processQueue() {
 function browserSpeak(text, playerName, epoch, done) {
   if (epoch !== ttsEpoch) return;
   if (!window.speechSynthesis) { done(); return; }
-  if (!voicesLoaded) initVoices();
-  const params = getVoiceParams(playerName);
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'zh-CN';
-  utterance.pitch = params.pitch;
-  utterance.rate = params.rate;
-  utterance.volume = 1.0;
-  const voice = params.gender === 'female' ? femaleVoice : maleVoice;
-  if (voice) utterance.voice = voice;
-  // speechSynthesis.cancel() 会触发 onend/onerror；跨代时不驱动队列（done 内部也有兜底校验）。
-  utterance.onend = done;
-  utterance.onerror = done;
-  speechSynthesis.speak(utterance);
+  void waitForTtsResume().then(() => {
+    if (epoch !== ttsEpoch) return;
+    if (!voicesLoaded) initVoices();
+    const params = getVoiceParams(playerName);
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'zh-CN';
+    utterance.pitch = params.pitch;
+    utterance.rate = params.rate;
+    utterance.volume = 1.0;
+    const voice = params.gender === 'female' ? femaleVoice : maleVoice;
+    if (voice) utterance.voice = voice;
+    // speechSynthesis.cancel() 会触发 onend/onerror；跨代时不驱动队列（done 内部也有兜底校验）。
+    utterance.onend = done;
+    utterance.onerror = done;
+    speechSynthesis.speak(utterance);
+  });
 }
 
 // ====== WebSocket 连接 ======
@@ -437,6 +530,7 @@ function handleEvent(msg) {
       }
       authenticated = true;
       void refreshBackendTtsStatus();
+      isHost = !!msg.data.isHost;
       mySeatId = msg.data.seatId || null;
       capabilities = msg.data.capabilities || {};
       roomState = msg.data.room || roomState;
@@ -450,6 +544,7 @@ function handleEvent(msg) {
         eventSequenceGuard.seed(state.gameId, msg.data.stateSequence);
         if (serverRunning) {
           restoreRunningGame(state);
+          restoreSpeechHistory(msg.data.speechHistory, msg.data.pendingPresentationSequence);
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
         } else if (!hasReplay) {
@@ -463,6 +558,7 @@ function handleEvent(msg) {
       break;
     }
     case 'session_updated':
+      if (typeof msg.data.isHost === 'boolean') isHost = msg.data.isHost;
       mySeatId = msg.data.seatId || null;
       capabilities = msg.data.capabilities || capabilities;
       roomState = msg.data.room || roomState;
@@ -506,7 +602,7 @@ function handleEvent(msg) {
       onSheriffElectionStart(msg.data);
       break;
     case 'sheriff_speech':
-      onSheriffSpeech(msg.data);
+      onSheriffSpeech(msg.data, msg.sequence);
       break;
     case 'sheriff_withdraw':
       onSheriffWithdraw(msg.data);
@@ -524,7 +620,7 @@ function handleEvent(msg) {
       onSheriffElectionEnd(msg.data);
       break;
     case 'sheriff_pk_speech':
-      onSheriffPkSpeech(msg.data);
+      onSheriffPkSpeech(msg.data, msg.sequence);
       break;
     case 'wolf_explode':
       onWolfExplode(msg.data);
@@ -533,10 +629,10 @@ function handleEvent(msg) {
       onSheriffTransfer(msg.data);
       break;
     case 'player_speak':
-      onPlayerSpeak(msg.data);
+      onPlayerSpeak(msg.data, msg.sequence);
       break;
     case 'sheriff_final_speech':
-      onSheriffFinalSpeech(msg.data);
+      onSheriffFinalSpeech(msg.data, msg.sequence);
       break;
     case 'player_vote':
       onPlayerVote(msg.data);
@@ -588,17 +684,20 @@ function handleEvent(msg) {
       break;
     case 'game_paused':
       gamePaused = true;
+      pauseTtsPlayback();
       updateControlButtons();
       addLog('游戏已暂停', 'system');
       addSystemMessage('⏸ 游戏已暂停');
       break;
     case 'game_resumed':
       gamePaused = false;
+      resumeTtsPlayback();
       updateControlButtons();
       addLog('游戏已继续', 'system');
       break;
     case 'game_cancelled':
       clearPendingHumanInput();
+      stopPendingTts();
       currentGameId = null;
       gameStarted = false;
       gamePaused = false;
@@ -659,12 +758,24 @@ function stopPendingTts(showQueuedMessages = false) {
   // 用户只是切到静音时，不能把已经收到但尚未轮到显示的发言一起丢掉。
   // 先按原顺序补显示，再清空语音队列；换局/回放则不传此参数，旧局内容直接作废。
   if (showQueuedMessages) {
+    if (currentTtsItem) {
+      try {
+        showTtsItem(currentTtsItem);
+        finishTtsItem(currentTtsItem);
+      } catch (e) { console.error('完成当前发言失败:', e); }
+    }
     for (const item of ttsQueue) {
-      try { item.showMessage?.(); } catch (e) { console.error('显示排队发言失败:', e); }
+      try {
+        showTtsItem(item);
+        finishTtsItem(item);
+      } catch (e) { console.error('显示排队发言失败:', e); }
     }
   }
   ttsQueue = [];
   ttsSpeaking = false;
+  currentTtsItem = null;
+  currentAudioFallback = null;
+  releaseTtsResumeWaiters();
 }
 
 // 游戏结束后的“再来一局”只恢复待开始页面；用户重新选择模式后才发送 start_game。
@@ -1229,6 +1340,35 @@ function restoreRunningGame(state) {
   addSystemMessage('🔄 已重新连接服务器，恢复当前对局。');
 }
 
+/**
+ * 活动局刷新或新观众加入时恢复已经公开的发言卡片。历史发言只补文字；如果服务端仍在
+ * 等待某一条发言的播放回执，只让主持人浏览器重新朗读这一条并在结束后回执。
+ */
+function restoreSpeechHistory(history, pendingSequence) {
+  if (!Array.isArray(history) || history.length === 0) return;
+  const pending = history.find(event => event?.sequence === pendingSequence) || null;
+  const previousReplaying = replaying;
+  replaying = true;
+  try {
+    for (const event of history) {
+      if (!event || event === pending) continue;
+      renderSpeechHistoryEvent(event);
+    }
+  } finally {
+    replaying = previousReplaying;
+  }
+  if (pending) renderSpeechHistoryEvent(pending);
+}
+
+function renderSpeechHistoryEvent(event) {
+  switch (event.type) {
+    case 'player_speak': onPlayerSpeak(event.data, event.sequence); break;
+    case 'sheriff_speech': onSheriffSpeech(event.data, event.sequence); break;
+    case 'sheriff_pk_speech': onSheriffPkSpeech(event.data, event.sequence); break;
+    case 'sheriff_final_speech': onSheriffFinalSpeech(event.data, event.sequence); break;
+  }
+}
+
 function onGameStart(data) {
   // 兜底作废上一局的语音。game_start 是所有开局路径的必经点（观战/参战/再来一局/
   // 回放后开新局），在这里清一次可以覆盖任何漏调 stopPendingTts 的入口——
@@ -1341,11 +1481,11 @@ function onDawnResult(data) {
   }
 }
 
-function onPlayerSpeak(data) {
-  addSpeechMessage(data, `${data.playerName} 发言`);
+function onPlayerSpeak(data, sequence) {
+  addSpeechMessage(data, `${data.playerName} 发言`, sequence);
 }
 
-function onSheriffFinalSpeech(data) {
+function onSheriffFinalSpeech(data, sequence) {
   // 警长归票发言用特殊样式显示
   const speechData = {
     playerId: data.sheriffId,
@@ -1355,7 +1495,7 @@ function onSheriffFinalSpeech(data) {
     publicSpeech: data.speech,
     round: data.round,
   };
-  addSpeechMessage(speechData, `🏅 ${data.sheriffName} 归票`);
+  addSpeechMessage(speechData, `🏅 ${data.sheriffName} 归票`, sequence);
 }
 
 // ====== 警长竞选事件处理 ======
@@ -1370,7 +1510,7 @@ function onSheriffElectionStart(data) {
   }
 }
 
-function onSheriffSpeech(data) {
+function onSheriffSpeech(data, sequence) {
   const speechData = {
     playerId: data.playerId,
     playerName: `🏅 ${data.playerName}`,
@@ -1379,7 +1519,7 @@ function onSheriffSpeech(data) {
     publicSpeech: data.speech,
     round: 0,
   };
-  addSpeechMessage(speechData, `🎤 ${data.playerName} 竞选演说`);
+  addSpeechMessage(speechData, `🎤 ${data.playerName} 竞选演说`, sequence);
 }
 
 function onSheriffWithdraw(data) {
@@ -1418,7 +1558,7 @@ function onSheriffElectionEnd(data) {
   addLog(`⚠️ ${reason}`, 'system');
 }
 
-function onSheriffPkSpeech(data) {
+function onSheriffPkSpeech(data, sequence) {
   const speechData = {
     playerId: data.playerId,
     playerName: `⚔️ ${data.playerName}`,
@@ -1427,7 +1567,7 @@ function onSheriffPkSpeech(data) {
     publicSpeech: data.speech,
     round: 0,
   };
-  addSpeechMessage(speechData, `⚔️ ${data.playerName} PK发言`);
+  addSpeechMessage(speechData, `⚔️ ${data.playerName} PK发言`, sequence);
 }
 
 function onWolfExplode(data) {
@@ -1645,7 +1785,7 @@ function onLlmAlert(data) {
   addLog(`LLM 熔断: ${data?.reason || kind}`, 'system');
 }
 
-function addSpeechMessage(data, logText = '') {
+function addSpeechMessage(data, logText = '', sequence) {
   const showMessage = () => {
     const area = document.getElementById('dialogueArea');
     const div = document.createElement('div');
@@ -1683,9 +1823,10 @@ function addSpeechMessage(data, logText = '') {
 
   const publicSpeech = String(data.publicSpeech ?? '');
   if (publicSpeech) {
-    speakText(publicSpeech, data.playerName, showMessage);
+    speakText(publicSpeech, data.playerName, showMessage, sequence);
   } else {
     showMessage();
+    sendSpeechPresented(sequence);
   }
 }
 
