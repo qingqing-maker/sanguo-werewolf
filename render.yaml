@@ -20,7 +20,7 @@ services:
       - key: LLM_BASE_URL
         value: https://ark.cn-beijing.volces.com/api/v3
       - key: LLM_MODEL_ID
-        value: doubao-seed-code-preview-251028
+        value: deepseek-v4-flash-ga-260731
       - key: LLM_API_STYLE
         value: responses
       - key: LLM_API_KEY
@@ -30,9 +30,9 @@ services:
       - key: LLM_CALL_BUDGET
         value: "500"
       - key: LLM_BUDGET_LEDGER_PATH
-        value: /var/data/runs/llm-budget-doubao-seed-code-preview-251028-production-v1.jsonl
+        value: /var/data/runs/llm-budget-deepseek-v4-flash-ga-260731-production-v1.jsonl
       - key: LLM_BUDGET_PERIOD
-        value: doubao-seed-code-preview-251028-production-v1
+        value: deepseek-v4-flash-ga-260731-production-v1
       - key: LLM_FALLBACK_STRATEGY
         value: none
       - key: LLM_TIMEOUT_MS
