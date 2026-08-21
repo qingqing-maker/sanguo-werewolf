@@ -52,7 +52,7 @@
     "dotenv": "16.4.7",
     "express": "^4.22.2",
     "msedge-tts": "^2.0.7",
-    "openai": "4.77.0",
+    "openai": "7.4.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {
