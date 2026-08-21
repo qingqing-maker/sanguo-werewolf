@@ -19,13 +19,8 @@ import * as path from 'node:path';
 
 import { readFallbackStrategy, readTimeoutMs } from './llm/LLMProvider';
 import { RNG_ALGORITHM, RNG_DERIVATION_VERSION, RNG_SCHEMA_VERSION } from './random';
-
-/** 与 PhaseManager.misfireRate 保持一致的读取逻辑（那里是私有函数，这里只读同样的 env）。 */
-function readRate(envKey: string, def: number): number {
-  const raw = parseFloat(process.env[envKey] || '');
-  if (Number.isFinite(raw) && raw >= 0 && raw <= 1) return raw;
-  return def;
-}
+import { resolveDifficultyMisfireRate } from './game/difficultyProfile';
+import { Difficulty } from './types';
 
 /** 与 BaseAgent.tacticsEnabled 保持一致：off/0/false/no 关闭，其余开启。 */
 function readTacticStyles(): boolean {
@@ -128,6 +123,9 @@ export interface SimFingerprint {
  */
 export function collectFingerprint(aiDifficulty: string, useReal: boolean): SimFingerprint {
   const scaleRaw = parseFloat(process.env.PACING_SCALE || '1');
+  const difficulty: Difficulty = ['novice', 'standard', 'expert'].includes(aiDifficulty)
+    ? aiDifficulty as Difficulty
+    : 'standard';
   return {
     fingerprintVersion: 2,
     random: {
@@ -147,8 +145,8 @@ export function collectFingerprint(aiDifficulty: string, useReal: boolean): SimF
     aiDifficulty,
     tacticStyles: readTacticStyles(),
     misfire: {
-      seerRepeat: readRate('MISFIRE_SEER_REPEAT', 0.12),
-      guardRepeat: readRate('MISFIRE_GUARD_REPEAT', 0.12),
+      seerRepeat: resolveDifficultyMisfireRate(difficulty, 'seerRepeat'),
+      guardRepeat: resolveDifficultyMisfireRate(difficulty, 'guardRepeat'),
     },
     pacing: {
       fastMode: process.env.FAST_MODE === '1',
@@ -179,7 +177,7 @@ export function formatFingerprint(fp: SimFingerprint | null | undefined): string
     lines.push('  · 随机：（旧文件无字段，seed 结果不可与新版直接比较）');
   }
   lines.push(`  · 模型：${fp.llm.modelId ?? '(未设)'}  provider=${fp.llm.provider ?? '(未设)'}  端点=${fp.llm.baseHost ?? '(未设)'}`);
-  lines.push(`  · AI 难度：${fp.aiDifficulty}   说话风格：${fp.tacticStyles ? '开' : '关'}`);
+  lines.push(`  · AI 思考强度：${fp.aiDifficulty}   说话风格：${fp.tacticStyles ? '开' : '关'}`);
   lines.push(
     `  · 失误注入：预言家重复验=${fp.misfire.seerRepeat}  守卫连守=${fp.misfire.guardRepeat}（狼人自刀已改为主动战术，不再计失误率）`,
   );

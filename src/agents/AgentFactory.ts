@@ -55,10 +55,10 @@ export class AgentFactory {
    * 为一局游戏创建所有 Agent
    * @param roles 已分配的角色列表（已打乱顺序）
    * @param forcedCharacterName 人类玩家选定的人物名，必须进入本局阵容（参战模式）；为空则纯随机
-   * @param difficulty AI 强度档位；对全部 12 个 AI 座位统一生效
-   *   - novice：新手档，AI 大幅降智（prompt 极简、记忆窗口极短、关键事实块清空）
-   *   - standard：标准档，AI 中等强度
-   *   - expert：高阶档，保持当前满血 baseline
+   * @param difficulty AI 思考强度的兼容协议值；对全部 AI 座位统一生效
+   *   - novice：轻量思考（短记忆、基础策略）
+   *   - standard：标准思考（默认）
+   *   - expert：深度思考（完整事实和长期策略）
    */
   createAgents(
     roles: RoleType[],

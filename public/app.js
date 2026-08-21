@@ -32,6 +32,9 @@ if (!/^[A-Za-z0-9_-]{43}$/.test(sessionToken || '')) {
 }
 let authenticated = false;
 let isHost = false;
+// 同一主持人可开多个标签页，但只有服务端授予租约的一个连接负责 TTS 和播放完成回执。
+let isPresentationClient = false;
+let presentationToken = null;
 let capabilities = {};
 let roomState = { exists: false, roomId: null, isCreator: false };
 let pendingHumanRequest = null;
@@ -41,22 +44,22 @@ let reconnectDelayMs = 1000;
 let reconnectStopped = false;
 // 当前 socket generation 是否已应用过权威 authenticated 快照。防止重复握手再次清空/重建 UI。
 let authenticatedGeneration = 0;
-// AI 强度档位：novice / standard / expert。随 start_game / restart_game 的 config 发给后端。
+// AI 思考强度的兼容协议值：novice / standard / expert。
 // 观战与参战两条路径都会读取这个值，默认 standard。
 let aiDifficulty = 'standard';
 
 // 难度选项的一句话说明，切换 radio 时更新提示文案。
 const AI_DIFFICULTY_HINTS = {
-  novice: '新手：AI 会明显降智，逻辑短板多，适合新手上手',
-  standard: '标准：接近普通玩家水平',
-  expert: '高阶：AI 满血推理，老手来挑战',
+  novice: '轻量思考：短记忆、基础策略，允许更多规则内失误；运行更轻',
+  standard: '标准思考：中等记忆、近期关键事实和常规策略',
+  expert: '深度思考：完整关键事实、长期立场和高级策略；不保证某阵营胜率',
 };
 
 // 顶栏"当前局"标签文案：把后端难度枚举映射成中文局名。
 const AI_DIFFICULTY_BADGE = {
-  novice: '🌱 新人局',
-  standard: '⚔️ 标准局',
-  expert: '🔥 高阶局',
+  novice: '🌱 轻量思考',
+  standard: '⚔️ 标准思考',
+  expert: '🔥 深度思考',
 };
 
 // 根据本局难度刷新顶栏标签。缺失/非法值默认 standard，避免空白。
@@ -95,6 +98,8 @@ let currentAudio = null;
 let currentAudioFallback = null;
 let currentTtsItem = null;
 let ttsResumeWaiters = [];
+const presentationSpeechBySequence = new Map();
+const queuedPresentationSequences = new Set();
 
 /**
  * TTS 代次（epoch）令牌。每次"作废所有待播语音"（换局/重开/静音/回放）都自增。
@@ -197,7 +202,7 @@ function notifyTtsQuotaExhausted() {
 }
 
 function sendSpeechPresented(sequence) {
-  if (!isHost || !authenticated || replaying || !currentGameId) return;
+  if (!isHost || !isPresentationClient || !authenticated || replaying || !currentGameId) return;
   if (!Number.isSafeInteger(sequence) || sequence <= 0) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({
@@ -257,7 +262,13 @@ function speakText(text, playerName, showMessage, sequence) {
     shown: false,
     presented: false,
   };
+  // 非展示端只恢复文字。服务端只接受唯一展示端的回执，因此其他标签页绝不能合成或播放。
+  if (!isPresentationClient) {
+    showTtsItem(item);
+    return;
+  }
   if (!ttsEnabled) {
+    if (Number.isSafeInteger(sequence) && sequence > 0) queuedPresentationSequences.add(sequence);
     showTtsItem(item);
     finishTtsItem(item);
     return;
@@ -267,6 +278,7 @@ function speakText(text, playerName, showMessage, sequence) {
     showTtsItem(item);
     return;
   }
+  if (Number.isSafeInteger(sequence) && sequence > 0) queuedPresentationSequences.add(sequence);
   // 若后端 TTS 不可用，且浏览器也没有 speechSynthesis，直接跳过
   if (!backendTtsAvailable && !window.speechSynthesis) {
     showTtsItem(item);
@@ -279,6 +291,25 @@ function speakText(text, playerName, showMessage, sequence) {
   // 因而下一名角色不会在上一名角色尚未读完时提前出现。
   ttsQueue.push(item);
   processQueue();
+}
+
+function resumePendingPresentation(sequence) {
+  if (!isPresentationClient || !Number.isSafeInteger(sequence) || sequence <= 0) return;
+  if (queuedPresentationSequences.has(sequence) || currentTtsItem?.sequence === sequence) return;
+  const speech = presentationSpeechBySequence.get(sequence);
+  if (!speech) return;
+  speakText(speech.text, speech.playerName, () => {}, sequence);
+}
+
+function applyPresentationRole(enabled, pendingSequence, nextPresentationToken = null) {
+  const next = !!enabled;
+  if (isPresentationClient && !next) {
+    // 租约转给其他标签页时只补齐本页文字，不能替新展示端发送 ACK。
+    stopPendingTts(true, false);
+  }
+  isPresentationClient = next;
+  presentationToken = isPresentationClient ? nextPresentationToken : null;
+  if (isPresentationClient) resumePendingPresentation(pendingSequence);
 }
 
 async function processQueue() {
@@ -318,7 +349,11 @@ async function processQueue() {
     try {
       const resp = await fetch('/api/tts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+          'X-Presentation-Token': presentationToken || '',
+        },
         body: JSON.stringify({ text, playerName }),
       });
       // fetch 往返期间用户可能已经换局：此时这段音频属于上一局，丢弃。
@@ -450,6 +485,9 @@ function connectWebSocket() {
   socket.onclose = (event) => {
     if (generation !== connectionGeneration || socket !== ws) return;
     authenticated = false;
+    if (isPresentationClient) stopPendingTts(true, false);
+    isPresentationClient = false;
+    presentationToken = null;
     clearPendingHumanInput();
     isReconnect = true;
     if (event.code === 4002) {
@@ -531,6 +569,8 @@ function handleEvent(msg) {
       authenticated = true;
       void refreshBackendTtsStatus();
       isHost = !!msg.data.isHost;
+      isPresentationClient = !!msg.data.isPresentationClient;
+      presentationToken = isPresentationClient ? msg.data.presentationToken || null : null;
       mySeatId = msg.data.seatId || null;
       capabilities = msg.data.capabilities || {};
       roomState = msg.data.room || roomState;
@@ -544,7 +584,9 @@ function handleEvent(msg) {
         eventSequenceGuard.seed(state.gameId, msg.data.stateSequence);
         if (serverRunning) {
           restoreRunningGame(state);
-          restoreSpeechHistory(msg.data.speechHistory, msg.data.pendingPresentationSequence);
+          restoreActiveTimeline(msg.data.publicTimeline, msg.data.pendingPresentationSequence, state);
+          restorePrivateSnapshot(msg.data.privateSnapshot);
+          addSystemMessage('🔄 已连接服务器，以上为当前对局的完整公共时间线。');
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
         } else if (!hasReplay) {
@@ -559,11 +601,17 @@ function handleEvent(msg) {
     }
     case 'session_updated':
       if (typeof msg.data.isHost === 'boolean') isHost = msg.data.isHost;
+      if (typeof msg.data.isPresentationClient === 'boolean') {
+        applyPresentationRole(msg.data.isPresentationClient, msg.data.pendingPresentationSequence, msg.data.presentationToken);
+      }
       mySeatId = msg.data.seatId || null;
       capabilities = msg.data.capabilities || capabilities;
       roomState = msg.data.room || roomState;
       document.body.classList.toggle('human-mode', !!mySeatId);
       updateControlButtons();
+      break;
+    case 'presentation_role':
+      applyPresentationRole(msg.data.isPresentationClient, msg.data.pendingPresentationSequence, msg.data.presentationToken);
       break;
     case 'room_state':
       roomState = {
@@ -748,7 +796,7 @@ function enterGameView() {
  * 照样会 new Audio().play()，于是上一局的语音漏进新一局（实测就是这个现象）。
  * 递增代次后，所有在途回调在每个 await 边界都会发现 epoch 不匹配而自行退出。
  */
-function stopPendingTts(showQueuedMessages = false) {
+function stopPendingTts(showQueuedMessages = false, acknowledgeQueuedMessages = showQueuedMessages) {
   ttsEpoch++;
   if (currentAudio) {
     try { currentAudio.pause(); currentAudio.src = ''; } catch {}
@@ -761,15 +809,19 @@ function stopPendingTts(showQueuedMessages = false) {
     if (currentTtsItem) {
       try {
         showTtsItem(currentTtsItem);
-        finishTtsItem(currentTtsItem);
+        if (acknowledgeQueuedMessages) finishTtsItem(currentTtsItem);
       } catch (e) { console.error('完成当前发言失败:', e); }
     }
     for (const item of ttsQueue) {
       try {
         showTtsItem(item);
-        finishTtsItem(item);
+        if (acknowledgeQueuedMessages) finishTtsItem(item);
       } catch (e) { console.error('显示排队发言失败:', e); }
     }
+  }
+  if (currentTtsItem?.sequence) queuedPresentationSequences.delete(currentTtsItem.sequence);
+  for (const item of ttsQueue) {
+    if (item?.sequence) queuedPresentationSequences.delete(item.sequence);
   }
   ttsQueue = [];
   ttsSpeaking = false;
@@ -787,6 +839,8 @@ function resetToWelcome() {
   humanCharacterName = null;
   mySeatId = null;
   replaying = false;
+  presentationSpeechBySequence.clear();
+  queuedPresentationSequences.clear();
   clearPendingHumanInput();
 
   stopPendingTts();
@@ -1295,6 +1349,11 @@ function onServerLostGame() {
 function restoreRunningGame(state) {
   if (!state || !Array.isArray(state.players) || state.players.length === 0) return;
 
+  stopPendingTts();
+  presentationSpeechBySequence.clear();
+  queuedPresentationSequences.clear();
+  degradeSeen.clear();
+  resetProviderFallbackBadge();
   currentGameId = state.gameId || null;
   gameStarted = true;
   gamePaused = !!state.paused;
@@ -1308,7 +1367,11 @@ function restoreRunningGame(state) {
 
   enterGameView();
   renderPlayerList(state.players);
+  applyAuthoritativeRunningState(state);
+}
 
+function applyAuthoritativeRunningState(state) {
+  gamePaused = !!state.paused;
   // 顶栏阶段/轮次：后端下发时才带 round/phase，缺失就等下一个 phase_change 事件覆盖。
   if (state.round) {
     const roundInfo = document.getElementById('roundInfo');
@@ -1336,36 +1399,86 @@ function restoreRunningGame(state) {
   if (btnRestart) btnRestart.style.display = '';
   const btnStart = document.getElementById('btnStart');
   if (btnStart) btnStart.disabled = true;
-
-  addSystemMessage('🔄 已重新连接服务器，恢复当前对局。');
 }
 
 /**
- * 活动局刷新或新观众加入时恢复已经公开的发言卡片。历史发言只补文字；如果服务端仍在
- * 等待某一条发言的播放回执，只让主持人浏览器重新朗读这一条并在结束后回执。
+ * 活动局刷新或新观众加入时恢复完整公共时间线。历史只渲染、不重播语音，也不让历史
+ * pause/phase/game_start 改坏 authenticated 权威状态。仍待播放的那一条最后由展示端接管。
  */
-function restoreSpeechHistory(history, pendingSequence) {
-  if (!Array.isArray(history) || history.length === 0) return;
-  const pending = history.find(event => event?.sequence === pendingSequence) || null;
+let activeTimelineRestoring = false;
+function restoreActiveTimeline(timeline, pendingSequence, state) {
+  if (!Array.isArray(timeline) || timeline.length === 0) return;
   const previousReplaying = replaying;
   replaying = true;
+  activeTimelineRestoring = true;
   try {
-    for (const event of history) {
-      if (!event || event === pending) continue;
-      renderSpeechHistoryEvent(event);
+    for (const event of timeline) {
+      if (!event) continue;
+      renderActiveTimelineEvent(event);
     }
   } finally {
+    activeTimelineRestoring = false;
     replaying = previousReplaying;
   }
-  if (pending) renderSpeechHistoryEvent(pending);
+  applyAuthoritativeRunningState(state);
+  resumePendingPresentation(pendingSequence);
 }
 
-function renderSpeechHistoryEvent(event) {
+function renderActiveTimelineEvent(event) {
   switch (event.type) {
+    case 'game_start':
+      addSystemMessage('⚔️ 游戏开始！十二位英雄齐聚，暗藏四名细作...');
+      addLog('游戏开始', 'system');
+      break;
+    case 'phase_change': onPhaseChange(event.data); break;
+    case 'dawn_result': onDawnResult(event.data); break;
+    case 'sheriff_election_start': onSheriffElectionStart(event.data); break;
     case 'player_speak': onPlayerSpeak(event.data, event.sequence); break;
     case 'sheriff_speech': onSheriffSpeech(event.data, event.sequence); break;
+    case 'sheriff_withdraw': onSheriffWithdraw(event.data); break;
+    case 'sheriff_vote': onSheriffVote(event.data); break;
+    case 'sheriff_vote_result': onSheriffVoteResult(event.data); break;
+    case 'sheriff_elected': onSheriffElected(event.data); break;
+    case 'sheriff_election_end': onSheriffElectionEnd(event.data); break;
     case 'sheriff_pk_speech': onSheriffPkSpeech(event.data, event.sequence); break;
+    case 'wolf_explode': onWolfExplode(event.data); break;
+    case 'sheriff_transfer': onSheriffTransfer(event.data); break;
     case 'sheriff_final_speech': onSheriffFinalSpeech(event.data, event.sequence); break;
+    case 'player_vote': onPlayerVote(event.data); break;
+    case 'vote_result': onVoteResult(event.data); break;
+    case 'vote_pk_start':
+      addSystemMessage('⚖️ 投票平局，进入 PK 复投');
+      addLog('进入 PK 复投', 'vote');
+      break;
+    case 'vote_tie':
+      addSystemMessage('⚖️ ' + event.data.message);
+      addLog('投票平局', 'vote');
+      break;
+    case 'player_eliminated': onPlayerEliminated(event.data); break;
+    case 'player_last_words': onPlayerLastWords(event.data); break;
+    case 'hunter_shoot': onHunterShoot(event.data); break;
+    case 'ai_decision_degraded': onAiDecisionDegraded(event.data); break;
+    case 'provider_fallback': onProviderFallback(event.data); break;
+    case 'llm_alert': onLlmAlert(event.data); break;
+    case 'game_paused':
+      addLog('游戏已暂停', 'system');
+      addSystemMessage('⏸ 游戏已暂停');
+      break;
+    case 'game_resumed':
+      addLog('游戏已继续', 'system');
+      break;
+  }
+}
+
+function restorePrivateSnapshot(snapshot) {
+  if (!snapshot) return;
+  if (Array.isArray(snapshot.wolfPartners) && snapshot.wolfPartners.length > 0) {
+    addSystemMessage(`🐺 你的狼人同伴：${snapshot.wolfPartners.map(partner => partner.name).join('、')}`);
+  }
+  if (Array.isArray(snapshot.seerResults)) {
+    for (const result of snapshot.seerResults) {
+      addSystemMessage(`🔮 第 ${result.round} 轮查验 ${result.name}：${result.isWolf ? '🐺 狼人' : '😇 好人'}`);
+    }
   }
 }
 
@@ -1374,6 +1487,8 @@ function onGameStart(data) {
   // 回放后开新局），在这里清一次可以覆盖任何漏调 stopPendingTts 的入口——
   // 包括"后端自行开新局"这种不经过任何前端按钮的情况。
   stopPendingTts();
+  presentationSpeechBySequence.clear();
+  queuedPresentationSequences.clear();
   currentGameId = data.gameId || null;
   gameStarted = true;
   gamePaused = false;
@@ -1823,6 +1938,12 @@ function addSpeechMessage(data, logText = '', sequence) {
 
   const publicSpeech = String(data.publicSpeech ?? '');
   if (publicSpeech) {
+    if (Number.isSafeInteger(sequence) && sequence > 0) {
+      presentationSpeechBySequence.set(sequence, {
+        text: publicSpeech,
+        playerName: String(data.playerName ?? ''),
+      });
+    }
     speakText(publicSpeech, data.playerName, showMessage, sequence);
   } else {
     showMessage();
@@ -1883,6 +2004,7 @@ function addVoteResultDisplay(tally) {
 }
 
 function showPhaseTransition(text, phaseClass) {
+  if (activeTimelineRestoring) return;
   const overlay = document.createElement('div');
   overlay.className = `phase-transition ${phaseClass}`;
   overlay.innerHTML = `<span class="phase-transition-text">${text}</span>`;
@@ -1927,6 +2049,7 @@ function onAiDecisionDegraded(data) {
   const key = `${data.playerId}|${data.operation}|${data.kind}`;
   if (degradeSeen.has(key)) return;
   degradeSeen.add(key);
+  if (activeTimelineRestoring) return;
   // parse 类是"重试后仍失败"，比超时更值得注意（可能是 prompt 或模型侧的稳定问题）。
   showToast(
     'AI 决策降级',
@@ -1969,7 +2092,7 @@ function onProviderFallback(data) {
   updateProviderFallbackBadge();
 
   // 首次触发弹一次 toast；后续只累计不打扰。
-  if (providerFallbackCount === 1) {
+  if (providerFallbackCount === 1 && !activeTimelineRestoring) {
     showToast(
       'Provider 已降级到 Mock',
       `${data.from} 遇到"${reason}"，${op}这一次由 Mock 接管。可在设置里调整 LLM_FALLBACK_STRATEGY。`,

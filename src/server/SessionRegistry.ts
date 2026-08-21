@@ -102,6 +102,7 @@ export class SessionRegistry {
 
   hasRoom(): boolean { return !!this.roomCreatorSession && !!this.roomId; }
   getRoomId(): string | null { return this.roomId; }
+  getRoomCreator(): SessionRecord | null { return this.roomCreatorSession; }
   isRoomCreator(session: SessionRecord): boolean {
     return this.roomCreatorSession === session && session.isHost;
   }

@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { AddressInfo } from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
+import { randomBytes } from 'node:crypto';
 import { EventBus, GameEventBus } from '../game/EventBus';
 import { GameUIEvent } from '../game/GameEvents';
 import { GameController } from './GameController';
@@ -21,6 +22,7 @@ interface ConnectionContext {
   connectionId: string;
   session: SessionRecord | null;
   authTimer: NodeJS.Timeout | null;
+  isPresentationClient: boolean;
 }
 
 export interface WebServerOptions {
@@ -31,6 +33,9 @@ export interface WebServerOptions {
   sessionRegistry?: SessionRegistry;
   ttsService?: TTSService;
   eventBus?: GameEventBus;
+  hostDisconnectGraceMs?: number;
+  controlCooldownMs?: number;
+  minorControlCooldownMs?: number;
 }
 
 /** Express + WebSocket 服务；认证、座位与权限均绑定到服务端会话。 */
@@ -45,7 +50,15 @@ export class WebServer {
   private readonly ttsService: TTSService;
   private readonly eventBus: GameEventBus;
   private readonly authTimeoutMs: number;
+  private readonly hostDisconnectGraceMs: number;
+  private readonly controlCooldownMs: number;
+  private readonly minorControlCooldownMs: number;
+  private readonly controlTimestamps = new Map<string, Map<string, number>>();
   private unsubscribeEventBus: (() => void) | null = null;
+  private hostReleaseTimer: NodeJS.Timeout | null = null;
+  private pendingHostReleaseSession: SessionRecord | null = null;
+  private presentationConnectionId: string | null = null;
+  private presentationToken: string | null = null;
   private port: number;
   private nextConnectionId = 1;
 
@@ -57,6 +70,9 @@ export class WebServer {
     this.sessions = options.sessionRegistry ?? new SessionRegistry();
     this.ttsService = options.ttsService ?? getTTSService();
     this.authTimeoutMs = options.authTimeoutMs ?? 5_000;
+    this.hostDisconnectGraceMs = options.hostDisconnectGraceMs ?? this.readNonNegativeInt('HOST_DISCONNECT_GRACE_MS', 90_000);
+    this.controlCooldownMs = options.controlCooldownMs ?? this.readNonNegativeInt('CONTROL_COOLDOWN_MS', 10_000);
+    this.minorControlCooldownMs = options.minorControlCooldownMs ?? this.readNonNegativeInt('MINOR_CONTROL_COOLDOWN_MS', 1_000);
     this.setupExpress();
     this.setupWebSocket();
     this.unsubscribeEventBus = this.eventBus.onAll(event => this.handleGameEvent(event));
@@ -99,6 +115,13 @@ export class WebServer {
     const noStore: express.RequestHandler = (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); };
 
     this.app.post('/api/game/start', hostOnly, async (req, res) => {
+      const session = this.sessions.findBearer(req.header('authorization'))!;
+      const retryAfterSeconds = this.consumeControlPermit(session, 'start_restart', this.controlCooldownMs);
+      if (retryAfterSeconds !== null) {
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+        res.status(429).json({ success: false, reason: 'rate_limited', retryAfterSeconds });
+        return;
+      }
       const rawConfig = req.body?.config;
       const config = decodeGameConfig(rawConfig);
       if (config === null) { res.status(400).json({ success: false, reason: 'invalid_message' }); return; }
@@ -113,9 +136,9 @@ export class WebServer {
         res.status(500).json({ success: false, reason: 'server_error' });
       }
     });
-    this.app.post('/api/game/pause', hostOnly, (_req, res) => { this.gameController.pauseGame(); res.json({ success: true }); });
-    this.app.post('/api/game/resume', hostOnly, (_req, res) => { this.gameController.resumeGame(); res.json({ success: true }); });
-    this.app.post('/api/game/cancel', hostOnly, (_req, res) => { this.gameController.cancelGame(); res.json({ success: true }); });
+    this.app.post('/api/game/pause', hostOnly, (req, res) => this.handleHttpControl(req, res, 'pause', () => this.gameController.pauseGame()));
+    this.app.post('/api/game/resume', hostOnly, (req, res) => this.handleHttpControl(req, res, 'resume', () => this.gameController.resumeGame()));
+    this.app.post('/api/game/cancel', hostOnly, (req, res) => this.handleHttpControl(req, res, 'cancel', () => this.gameController.cancelGame()));
     this.app.post('/api/game/join', hostOnly, (_req, res) => res.status(410).json({ success: false, reason: 'deprecated' }));
     this.app.post('/api/game/leave', hostOnly, (_req, res) => res.status(410).json({ success: false, reason: 'deprecated' }));
 
@@ -130,8 +153,19 @@ export class WebServer {
     this.app.get('/api/tts/status', authenticatedOnly, (_req, res) => {
       res.json(this.ttsService.status());
     });
-    this.app.post('/api/tts', authenticatedOnly, async (req, res) => {
+    this.app.post('/api/tts', hostOnly, async (req, res) => {
       const session = this.sessions.findBearer(req.header('authorization'))!;
+      const presenter = this.presentationConnectionId
+        ? [...this.clients].find(context => context.connectionId === this.presentationConnectionId)
+        : null;
+      if (
+        !presenter
+        || presenter.session !== session
+        || req.header('x-presentation-token') !== this.presentationToken
+      ) {
+        res.status(403).json({ success: false, reason: 'forbidden' });
+        return;
+      }
       try {
         const result = await this.ttsService.synthesize({
           sessionId: session.sessionId,
@@ -178,7 +212,13 @@ export class WebServer {
 
   private setupWebSocket(): void {
     this.wss.on('connection', ws => {
-      const context: ConnectionContext = { ws, connectionId: `connection-${this.nextConnectionId++}`, session: null, authTimer: null };
+      const context: ConnectionContext = {
+        ws,
+        connectionId: `connection-${this.nextConnectionId++}`,
+        session: null,
+        authTimer: null,
+        isPresentationClient: false,
+      };
       this.clients.add(context);
       context.authTimer = setTimeout(() => {
         if (!context.session) ws.close(4001, 'authentication required');
@@ -195,7 +235,9 @@ export class WebServer {
       ws.on('close', () => {
         if (context.authTimer) clearTimeout(context.authTimer);
         this.clients.delete(context);
-        this.syncPresentationAvailability();
+        const session = context.session;
+        this.reconcilePresentationClient();
+        if (session) this.handleHostPresenceChange(session);
       });
       ws.on('error', () => { /* close 事件负责清理 */ });
     });
@@ -209,13 +251,14 @@ export class WebServer {
     if (command.type === 'create_room') {
       const result = this.sessions.createRoom(session);
       if (result === 'created' || result === 'already_creator') {
-        this.sendToSession(session, transportEvent('session_updated', {
+        this.cancelHostRelease(session);
+        this.reconcilePresentationClient(false);
+        this.sendSessionUpdated(session, {
           isHost: true,
           seatId: session.seatId,
           room: this.roomStateFor(session),
           capabilities: this.capabilities(session),
-        }));
-        this.syncPresentationAvailability();
+        });
         this.broadcastRoomState();
       } else {
         this.send(context, transportEvent('room_create_result', { success: false, reason: result }));
@@ -227,13 +270,14 @@ export class WebServer {
       if (this.gameController.getState().isRunning) { this.sendError(context, 'busy'); return; }
       const result = this.sessions.closeRoom(session);
       if (result === 'closed') {
-        this.sendToSession(session, transportEvent('session_updated', {
+        this.cancelHostRelease(session);
+        this.reconcilePresentationClient(false);
+        this.sendSessionUpdated(session, {
           isHost: false,
           seatId: null,
           room: this.roomStateFor(session),
           capabilities: this.capabilities(session),
-        }));
-        this.syncPresentationAvailability();
+        });
         this.broadcastRoomState();
       } else {
         this.send(context, transportEvent('error', { reason: result }));
@@ -247,18 +291,28 @@ export class WebServer {
       return;
     }
     if (command.type === 'speech_presented') {
-      if (!session.isHost) { this.sendError(context, 'forbidden'); return; }
+      if (!session.isHost || context.connectionId !== this.presentationConnectionId) { this.sendError(context, 'forbidden'); return; }
       if (session.gameId !== command.data.gameId) { this.sendError(context, 'wrong_game'); return; }
       this.gameController.handleSpeechPresented(command.data.gameId, command.data.sequence);
       return;
     }
     if (!session.isHost) { this.sendError(context, 'forbidden'); return; }
     switch (command.type) {
-      case 'start_game': void this.startForSession(session, command.config, false); break;
-      case 'restart_game': void this.startForSession(session, command.config, true); break;
-      case 'pause_game': this.gameController.pauseGame(); break;
-      case 'resume_game': this.gameController.resumeGame(); break;
-      case 'cancel_game': this.gameController.cancelGame(); break;
+      case 'start_game':
+        if (this.guardWebSocketControl(context, session, 'start_restart', this.controlCooldownMs)) void this.startForSession(session, command.config, false);
+        break;
+      case 'restart_game':
+        if (this.guardWebSocketControl(context, session, 'start_restart', this.controlCooldownMs)) void this.startForSession(session, command.config, true);
+        break;
+      case 'pause_game':
+        if (this.guardWebSocketControl(context, session, 'pause', this.minorControlCooldownMs)) this.gameController.pauseGame();
+        break;
+      case 'resume_game':
+        if (this.guardWebSocketControl(context, session, 'resume', this.minorControlCooldownMs)) this.gameController.resumeGame();
+        break;
+      case 'cancel_game':
+        if (this.guardWebSocketControl(context, session, 'cancel', this.minorControlCooldownMs)) this.gameController.cancelGame();
+        break;
     }
   }
 
@@ -267,15 +321,19 @@ export class WebServer {
     const session = this.sessions.authenticate(token);
     if (!session) { this.sendError(context, 'invalid_token'); context.ws.close(4002, 'invalid token'); return; }
     context.session = session;
+    if (this.sessions.isRoomCreator(session)) this.cancelHostRelease(session);
+    this.reconcilePresentationClient(false);
     if (context.authTimer) { clearTimeout(context.authTimer); context.authTimer = null; }
     const state = this.gameController.getState();
     const viewer = this.viewerFor(session);
     const privateSnapshot = session.seatId ? this.gameController.getSeatPrivateSnapshot(session.seatId) : null;
     const replay = state.isRunning ? null : this.getPublicReplay();
-    const speechHistory = state.isRunning && state.gameId ? this.getActiveSpeechHistory(state.gameId) : [];
+    const publicTimeline = state.isRunning && state.gameId ? this.getActivePublicTimeline(state.gameId) : [];
     this.send(context, transportEvent('authenticated', {
       sessionId: session.sessionId,
       isHost: session.isHost,
+      isPresentationClient: context.isPresentationClient,
+      presentationToken: context.isPresentationClient ? this.presentationToken : null,
       seatId: session.seatId,
       room: this.roomStateFor(session),
       capabilities: this.capabilities(session),
@@ -285,10 +343,9 @@ export class WebServer {
       stateSequence: state.gameId ? this.eventBus.getLatestSequence(state.gameId) : 0,
       hasReplay: !!replay?.events.length,
       replayGameId: replay?.gameId ?? null,
-      speechHistory,
+      publicTimeline,
       pendingPresentationSequence: this.gameController.getPendingPresentationSequence(),
     }));
-    this.syncPresentationAvailability();
     if (replay?.events.length) {
       this.send(context, transportEvent('replay_start', { gameId: replay.gameId, count: replay.events.length }));
       for (const event of replay.events) this.send(context, event);
@@ -305,11 +362,11 @@ export class WebServer {
       if (seat) this.sessions.bindSeat(session, gameId, seat.id);
       else this.sessions.bindGame(session, gameId);
       // 绑定发生在 game_start 投影之前；立即把服务端权威座位和新能力同步到同 token 的全部连接。
-      this.sendToSession(session, transportEvent('session_updated', {
+      this.sendSessionUpdated(session, {
         seatId: session.seatId,
         room: this.roomStateFor(session),
         capabilities: this.capabilities(session),
-      }));
+      });
     };
     try {
       const run = restart
@@ -331,7 +388,10 @@ export class WebServer {
       const projected = projectEventForViewer(source, this.viewerFor(context.session));
       if (projected) this.send(context, projected);
     }
-    if (source.type === 'game_end' || source.type === 'game_cancelled') this.sessions.clearGame(source.data.gameId);
+    if (source.type === 'game_end' || source.type === 'game_cancelled') {
+      this.sessions.clearGame(source.data.gameId);
+      setTimeout(() => this.maybeScheduleDisconnectedHostRelease(), 0);
+    }
   }
 
   private viewerFor(session: SessionRecord): ViewerContext {
@@ -395,17 +455,161 @@ export class WebServer {
     for (const context of this.clients) if (context.session === session) this.send(context, event);
   }
 
-  /** 活动局刷新/新观众进入时，仅补发公开发言历史；历史恢复不重播已完成的 TTS。 */
-  private getActiveSpeechHistory(gameId: string): GameUIEvent[] {
-    const speechTypes = new Set(['player_speak', 'sheriff_speech', 'sheriff_pk_speech', 'sheriff_final_speech']);
-    return this.eventLog.loadEvents(gameId).filter(event => speechTypes.has(event.type));
+  private sendSessionUpdated(session: SessionRecord, data: Record<string, unknown>): void {
+    for (const context of this.clients) {
+      if (context.session !== session) continue;
+      this.send(context, transportEvent('session_updated', {
+        ...data,
+        isPresentationClient: context.isPresentationClient,
+        presentationToken: context.isPresentationClient ? this.presentationToken : null,
+      }));
+    }
   }
 
-  private syncPresentationAvailability(): void {
-    const available = [...this.clients].some(context =>
-      !!context.session?.isHost && context.ws.readyState === WebSocket.OPEN
-    );
-    this.gameController.setPresentationClientAvailable(available);
+  /** 活动局刷新时恢复完整的安全公共时间线，不包含座位私密事件或内心信息。 */
+  private getActivePublicTimeline(gameId: string): GameUIEvent[] {
+    const events: GameUIEvent[] = [];
+    for (const source of this.eventLog.loadEvents(gameId)) {
+      try {
+        const projected = projectEventForPublicReplay(source);
+        if (!projected) continue;
+        JSON.stringify(projected);
+        events.push(projected);
+      } catch (error: unknown) {
+        console.warn(`[WebServer] 跳过无法恢复的活动局事件 ${source.type}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return events;
+  }
+
+  /** 保持恰好一个在线主持人连接负责 TTS；断线时由同会话的其他标签页接管。 */
+  private reconcilePresentationClient(notify = true): void {
+    const previousId = this.presentationConnectionId;
+    const previous = previousId
+      ? [...this.clients].find(context => context.connectionId === previousId)
+      : null;
+    const selected = previous && this.isEligiblePresentationClient(previous)
+      ? previous
+      : [...this.clients].find(context => this.isEligiblePresentationClient(context)) ?? null;
+    this.presentationConnectionId = selected?.connectionId ?? null;
+    if (this.presentationConnectionId !== previousId) {
+      this.presentationToken = this.presentationConnectionId ? randomBytes(32).toString('base64url') : null;
+    }
+
+    for (const context of this.clients) {
+      const wasPresentationClient = context.isPresentationClient;
+      context.isPresentationClient = context.connectionId === this.presentationConnectionId;
+      if (notify && wasPresentationClient !== context.isPresentationClient && context.session?.isHost) {
+        this.send(context, transportEvent('presentation_role', {
+          isPresentationClient: context.isPresentationClient,
+          presentationToken: context.isPresentationClient ? this.presentationToken : null,
+          pendingPresentationSequence: this.gameController.getPendingPresentationSequence(),
+        }));
+      }
+    }
+    this.gameController.setPresentationClientAvailable(!!selected);
+  }
+
+  private isEligiblePresentationClient(context: ConnectionContext): boolean {
+    return !!context.session?.isHost && context.ws.readyState === WebSocket.OPEN;
+  }
+
+  private hasOpenConnection(session: SessionRecord): boolean {
+    return [...this.clients].some(context => context.session === session && context.ws.readyState === WebSocket.OPEN);
+  }
+
+  private handleHostPresenceChange(session: SessionRecord): void {
+    if (!this.sessions.isRoomCreator(session)) return;
+    if (this.hasOpenConnection(session)) {
+      this.cancelHostRelease(session);
+      return;
+    }
+    if (this.gameController.getState().isRunning) {
+      this.pendingHostReleaseSession = session;
+      return;
+    }
+    this.scheduleHostRelease(session);
+  }
+
+  private maybeScheduleDisconnectedHostRelease(): void {
+    const creator = this.sessions.getRoomCreator();
+    if (creator && !this.hasOpenConnection(creator)) this.scheduleHostRelease(creator);
+  }
+
+  private scheduleHostRelease(session: SessionRecord): void {
+    if (!this.sessions.isRoomCreator(session) || this.hasOpenConnection(session)) return;
+    if (this.hostReleaseTimer && this.pendingHostReleaseSession === session) return;
+    this.cancelHostRelease();
+    this.pendingHostReleaseSession = session;
+    this.hostReleaseTimer = setTimeout(() => {
+      this.hostReleaseTimer = null;
+      const pending = this.pendingHostReleaseSession;
+      this.pendingHostReleaseSession = null;
+      if (!pending || !this.sessions.isRoomCreator(pending) || this.hasOpenConnection(pending)) return;
+      if (this.gameController.getState().isRunning) {
+        this.pendingHostReleaseSession = pending;
+        return;
+      }
+      if (this.sessions.closeRoom(pending) === 'closed') {
+        this.controlTimestamps.delete(pending.sessionId);
+        this.reconcilePresentationClient();
+        this.broadcastRoomState();
+        console.log('[WebServer] 主持人离线宽限期结束，已自动释放空闲房间');
+      }
+    }, this.hostDisconnectGraceMs);
+  }
+
+  private cancelHostRelease(session?: SessionRecord): void {
+    if (session && this.pendingHostReleaseSession && this.pendingHostReleaseSession !== session) return;
+    if (this.hostReleaseTimer) clearTimeout(this.hostReleaseTimer);
+    this.hostReleaseTimer = null;
+    this.pendingHostReleaseSession = null;
+  }
+
+  private consumeControlPermit(session: SessionRecord, bucket: string, cooldownMs: number): number | null {
+    if (cooldownMs <= 0) return null;
+    const now = Date.now();
+    const sessionEntries = this.controlTimestamps.get(session.sessionId) ?? new Map<string, number>();
+    const previous = sessionEntries.get(bucket) ?? 0;
+    const remaining = previous + cooldownMs - now;
+    if (remaining > 0) return Math.max(1, Math.ceil(remaining / 1_000));
+    sessionEntries.set(bucket, now);
+    this.controlTimestamps.set(session.sessionId, sessionEntries);
+    return null;
+  }
+
+  private guardWebSocketControl(
+    context: ConnectionContext,
+    session: SessionRecord,
+    bucket: string,
+    cooldownMs: number,
+  ): boolean {
+    const retryAfterSeconds = this.consumeControlPermit(session, bucket, cooldownMs);
+    if (retryAfterSeconds === null) return true;
+    this.send(context, transportEvent('error', { reason: 'rate_limited', retryAfterSeconds }));
+    return false;
+  }
+
+  private handleHttpControl(
+    req: express.Request,
+    res: express.Response,
+    bucket: string,
+    action: () => void,
+  ): void {
+    const session = this.sessions.findBearer(req.header('authorization'))!;
+    const retryAfterSeconds = this.consumeControlPermit(session, bucket, this.minorControlCooldownMs);
+    if (retryAfterSeconds !== null) {
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      res.status(429).json({ success: false, reason: 'rate_limited', retryAfterSeconds });
+      return;
+    }
+    action();
+    res.json({ success: true });
+  }
+
+  private readNonNegativeInt(key: string, fallback: number): number {
+    const value = Number(process.env[key]);
+    return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
   }
   private roomStateFor(session: SessionRecord): Record<string, unknown> {
     return {
@@ -447,6 +651,7 @@ export class WebServer {
   async stop(): Promise<void> {
     this.unsubscribeEventBus?.();
     this.unsubscribeEventBus = null;
+    this.cancelHostRelease();
     for (const context of this.clients) {
       if (context.authTimer) clearTimeout(context.authTimer);
       context.ws.terminate();

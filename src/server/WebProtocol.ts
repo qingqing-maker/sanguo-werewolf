@@ -17,7 +17,7 @@ export type TransportReasonCode =
   | 'authentication_required' | 'invalid_message' | 'invalid_token' | 'forbidden'
   | 'not_running' | 'not_owner' | 'no_pending_input' | 'wrong_game'
   | 'wrong_request' | 'wrong_seat' | 'invalid_input' | 'stale_request' | 'busy'
-  | 'room_taken' | 'room_not_found' | 'server_error';
+  | 'room_taken' | 'room_not_found' | 'rate_limited' | 'server_error';
 
 export interface TransportCapabilities {
   createRoom: boolean;

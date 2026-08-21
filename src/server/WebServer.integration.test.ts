@@ -132,7 +132,7 @@ async function main(): Promise<void> {
   const ttsProvider = new FakeTTSProvider();
   const ttsService = new TTSService({ provider: ttsProvider, sessionRequestLimit: 1, ipRequestLimit: 100 });
   const server = new WebServer({ port: 0, controller: controller as any, eventLog: eventLog as any, authTimeoutMs: 500,
-    ttsService, eventBus });
+    ttsService, eventBus, controlCooldownMs: 0, minorControlCooldownMs: 0, hostDisconnectGraceMs: 25 });
   const port = await server.start(0);
   const hostToken = token();
   const guestToken = token();
@@ -150,12 +150,19 @@ async function main(): Promise<void> {
   const sameHostRoomMessages = collectMessagesUntil(sameHost.ws, 'room_state');
   const guestRoomMessages = collectMessagesUntil(guest.ws, 'room_state');
   host.ws.send(JSON.stringify({ type: 'create_room' }));
-  for (const messages of [await hostRoomMessages, await sameHostRoomMessages]) {
+  const hostRoomTranscript = await hostRoomMessages;
+  const sameHostRoomTranscript = await sameHostRoomMessages;
+  for (const messages of [hostRoomTranscript, sameHostRoomTranscript]) {
     assert.deepEqual(messages.map(message => message.type), ['session_updated', 'room_state']);
     assert.equal(messages[0].data.isHost, true);
     assert.equal(messages[0].data.capabilities.startGame, true);
     assert.equal(messages[1].data.isCreator, true);
   }
+  assert.equal(hostRoomTranscript[0].data.isPresentationClient, true, '首个主持人连接应获得展示端租约');
+  assert.equal(sameHostRoomTranscript[0].data.isPresentationClient, false, '同 token 第二标签页不得同时播放');
+  let hostPresentationToken = hostRoomTranscript[0].data.presentationToken;
+  assert.match(hostPresentationToken, /^[A-Za-z0-9_-]{43}$/, '展示端应收到短期 TTS 凭证');
+  assert.equal(sameHostRoomTranscript[0].data.presentationToken, null);
   const guestRoomState = (await guestRoomMessages)[0];
   assert.equal(guestRoomState.data.exists, true);
   assert.equal(guestRoomState.data.isCreator, false);
@@ -172,6 +179,8 @@ async function main(): Promise<void> {
 
   guest.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 7 } }));
   assert.equal((await onceMessage(guest.ws)).data.reason, 'forbidden', '非主持人不得伪造播放完成回执');
+  sameHost.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 7 } }));
+  assert.equal((await onceMessage(sameHost.ws)).data.reason, 'forbidden', '非展示标签页不得伪造播放完成回执');
   host.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 7 } }));
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.deepEqual(controller.presented.at(-1), { gameId: 'game-test', sequence: 7 });
@@ -196,17 +205,42 @@ async function main(): Promise<void> {
   assert.equal((await onceMessage(sameHost.ws)).data.accepted, false, '第二次输入应 stale');
 
   controller.pending = { gameId: 'game-test', requestId: 'request-2', playerId: 'player_1', prompt: '恢复', options: {} };
+  const takeoverRole = onceMessage(sameHost.ws);
   host.ws.close();
+  const takeover = await takeoverRole;
+  assert.equal(takeover.type, 'presentation_role');
+  assert.equal(takeover.data.isPresentationClient, true, '主展示端断线后第二标签页应自动接管');
+  assert.notEqual(takeover.data.presentationToken, hostPresentationToken, '展示端接管时必须轮换 TTS 凭证');
+  hostPresentationToken = takeover.data.presentationToken;
+  sameHost.ws.send(JSON.stringify({ type: 'speech_presented', data: { gameId: 'game-test', sequence: 8 } }));
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(controller.presented.at(-1), { gameId: 'game-test', sequence: 8 });
   const reconnected = await connect(port, hostToken);
   assert.equal(reconnected.auth.data.pendingInput.requestId, 'request-2', '重连应恢复 pending');
   assert.equal(reconnected.auth.data.stateSequence, 1, '重连快照应携带当前局最新权威 sequence');
 
   // 活动局即使有磁盘历史也不得读取或发送 replay。
   eventLog.latest = { gameId: 'replay-game', events: [replayEvent('phase_change', 1)] };
+  eventLog.activeEvents = [
+    {
+      schemaVersion: CURRENT_EVENT_SCHEMA_VERSION, sequence: 1, timestamp: 1, type: 'phase_change',
+      data: { gameId: 'game-test', phase: 'day', round: 1 },
+    } as GameUIEvent,
+    {
+      schemaVersion: CURRENT_EVENT_SCHEMA_VERSION, sequence: 2, timestamp: 2, type: 'human_input_required',
+      data: { gameId: 'game-test', requestId: 'private-request', playerId: 'player_1', prompt: '私密', options: {} },
+    } as GameUIEvent,
+    {
+      schemaVersion: CURRENT_EVENT_SCHEMA_VERSION, sequence: 3, timestamp: 3, type: 'player_speak',
+      data: { gameId: 'game-test', playerId: 'player_1', playerName: '诸葛亮', title: '卧龙', innerThoughts: '私密心声', publicSpeech: '公开发言', round: 1 },
+    } as GameUIEvent,
+  ];
   const loadCallsBeforeRunningAuth = eventLog.loadCalls;
   const runningReconnect = await connect(port, token());
   assert.equal(runningReconnect.auth.data.hasReplay, false);
   assert.equal(eventLog.loadCalls, loadCallsBeforeRunningAuth, '活动局认证不得读取公共历史');
+  assert.deepEqual(runningReconnect.auth.data.publicTimeline.map((event: any) => event.type), ['phase_change', 'player_speak']);
+  assert.equal(JSON.stringify(runningReconnect.auth.data.publicTimeline).includes('私密'), false, '活动局时间线不得泄露私密事件或内心');
 
   const stateResponse = await fetch(`http://127.0.0.1:${port}/api/game/state`);
   const state = await stateResponse.json() as any;
@@ -227,8 +261,17 @@ async function main(): Promise<void> {
   assert.deepEqual(ttsStatus, { enabled: true, provider: 'offline-fake', configured: true, quotaExhausted: false });
   assert.equal(JSON.stringify(ttsStatus).includes('secret upstream'), false, 'status 不得泄露 quotaReason');
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/tts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'x' }) })).status, 401);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/tts`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${hostToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: '缺少展示凭证' }),
+  })).status, 403);
   const ttsOk = await fetch(`http://127.0.0.1:${port}/api/tts`, {
-    method: 'POST', headers: { Authorization: `Bearer ${guestToken}`, 'Content-Type': 'application/json' },
+    method: 'POST', headers: {
+      Authorization: `Bearer ${hostToken}`,
+      'X-Presentation-Token': hostPresentationToken,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({ text: '你好', playerName: '诸葛亮' }),
   });
   assert.equal(ttsOk.status, 200);
@@ -236,7 +279,13 @@ async function main(): Promise<void> {
   assert.equal(Buffer.from(await ttsOk.arrayBuffer()).toString(), 'offline:诸葛亮:你好');
   assert.equal(ttsProvider.calls, 1, '集成测试只调用注入的离线 provider');
   const ttsLimited = await fetch(`http://127.0.0.1:${port}/api/tts`, {
-    method: 'POST', headers: { Authorization: `Bearer ${guestToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: '再次' }),
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${hostToken}`,
+      'X-Presentation-Token': hostPresentationToken,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text: '再次' }),
   });
   assert.equal(ttsLimited.status, 429);
   assert.equal(ttsLimited.headers.get('retry-after'), '60');
@@ -248,7 +297,13 @@ async function main(): Promise<void> {
     (mapped as any).synthesize = async () => { throw new TTSServiceError(reason as any, 'internal provider message', reason === 'tts_concurrency_limited' ? 7 : undefined); };
     (server as any).ttsService = mapped;
     const response = await fetch(`http://127.0.0.1:${port}/api/tts`, {
-      method: 'POST', headers: { Authorization: `Bearer ${hostToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'mapping' }),
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${hostToken}`,
+        'X-Presentation-Token': hostPresentationToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text: 'mapping' }),
     });
     assert.equal(response.status, expectedStatus, reason);
     assert.deepEqual(await response.json(), { success: false, reason });
@@ -334,6 +389,77 @@ async function main(): Promise<void> {
   assert.equal((await rejectedMessage).data.reason, 'invalid_token');
   assert.equal(await rejectedClose, 4002);
   await rejectServer.stop();
+
+  // WebSocket 与 HTTP 控制命令共享稳定的 session 级冷却语义。
+  const rateController = new FakeController();
+  const rateServer = new WebServer({
+    port: 0,
+    controller: rateController as any,
+    eventLog: new FakeEventLog() as any,
+    authTimeoutMs: 500,
+    hostDisconnectGraceMs: 100,
+    controlCooldownMs: 5_000,
+    minorControlCooldownMs: 5_000,
+    ttsService,
+    eventBus: new EventBus(),
+  });
+  const ratePort = await rateServer.start(0);
+  const rateToken = token();
+  const rateHost = await connect(ratePort, rateToken);
+  const rateCreated = collectMessagesUntil(rateHost.ws, 'room_state');
+  rateHost.ws.send(JSON.stringify({ type: 'create_room' }));
+  await rateCreated;
+  const wsRateError = onceMessage(rateHost.ws);
+  rateHost.ws.send(JSON.stringify({ type: 'pause_game' }));
+  rateHost.ws.send(JSON.stringify({ type: 'pause_game' }));
+  const wsLimited = await wsRateError;
+  assert.equal(wsLimited.data.reason, 'rate_limited');
+  assert.ok(wsLimited.data.retryAfterSeconds >= 1);
+  const firstHttpStart = await fetch(`http://127.0.0.1:${ratePort}/api/game/start`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${rateToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: {} }),
+  });
+  assert.equal(firstHttpStart.status, 200);
+  const secondHttpStart = await fetch(`http://127.0.0.1:${ratePort}/api/game/start`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${rateToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: {} }),
+  });
+  assert.equal(secondHttpStart.status, 429);
+  assert.equal((await secondHttpStart.json() as any).reason, 'rate_limited');
+  assert.ok(Number(secondHttpStart.headers.get('retry-after')) >= 1);
+  rateHost.ws.close();
+  await rateServer.stop();
+
+  // 空闲房间在最后一个主持人连接离线并超过宽限期后自动释放。
+  const releaseController = new FakeController();
+  const releaseServer = new WebServer({
+    port: 0,
+    controller: releaseController as any,
+    eventLog: new FakeEventLog() as any,
+    authTimeoutMs: 500,
+    hostDisconnectGraceMs: 20,
+    controlCooldownMs: 0,
+    minorControlCooldownMs: 0,
+    ttsService,
+    eventBus: new EventBus(),
+  });
+  const releasePort = await releaseServer.start(0);
+  const releaseHost = await connect(releasePort, token());
+  const releaseGuest = await connect(releasePort, token());
+  const releaseHostCreated = collectMessagesUntil(releaseHost.ws, 'room_state');
+  const releaseGuestCreated = onceMessage(releaseGuest.ws);
+  releaseHost.ws.send(JSON.stringify({ type: 'create_room' }));
+  await releaseHostCreated;
+  assert.equal((await releaseGuestCreated).data.exists, true);
+  const releasedRoom = onceMessage(releaseGuest.ws);
+  releaseHost.ws.close();
+  const released = await releasedRoom;
+  assert.equal(released.type, 'room_state');
+  assert.equal(released.data.exists, false, '离线宽限期结束后空闲房间应自动释放');
+  releaseGuest.ws.close();
+  await releaseServer.stop();
 
   console.log('WebServer WebSocket/HTTP 集成测试通过');
 }

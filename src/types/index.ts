@@ -144,9 +144,8 @@ export interface ChatMessage {
 }
 
 /**
- * AI 强度分档：让人类玩家有梯度选择——新手档 AI 会明显打不过普通人，
- * 标准档接近"普通网友"水平，高阶档保持当前满血 prompt/记忆窗口。
- * 全局单一档位：一局内 12 个 AI 座位统一强度，不做 per-seat 混档。
+ * AI 思考强度的兼容协议值。档位控制记忆、事实材料、策略深度和规则内失误率；
+ * 因好人和狼人会同时增强，不承诺某阵营胜率随档位单调变化。
  */
 export type Difficulty = 'novice' | 'standard' | 'expert';
 

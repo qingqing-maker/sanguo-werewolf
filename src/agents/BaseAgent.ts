@@ -17,6 +17,7 @@ import { detectSelfSeerClaim, extractSeerVerdicts } from './seerClaim';
 import { resolvePlayerIdByName } from './nameResolver';
 import { MathRandomSource, RandomSource } from '../random';
 import { sanitizePlayerContent } from './playerContentSanitizer';
+import { difficultyMemoryWindow, getDifficultyProfile } from '../game/difficultyProfile';
 
 /**
  * 决策降级的前端提示文案。按失败类别给出**玩家能看懂**的说法，
@@ -239,10 +240,7 @@ export class BaseAgent {
   }
   private maxMemoryLength = 40;
   public isHumanPlayer = false; // 是否为人类玩家
-  // AI 强度档位；由 AgentFactory 在创建后统一设置。人类座位不使用此字段（走人类输入路径）。
-  // - novice：新手档，prompt 极简、记忆窗口极短、关键事实块清空，好人推理框架/投票 4 步引导全删
-  // - standard：标准档，中等强度（默认）
-  // - expert：高阶档，保持当前满血 baseline
+  // 协议值保持兼容；产品层称为“AI 思考强度”，不承诺阵营胜率或必然强弱。
   public difficulty: Difficulty = 'standard';
   public seerResults: { name: string; isWolf: boolean; round: number }[] = []; // 预言家查验记录
 
@@ -1353,18 +1351,17 @@ ${voteJsonHint}`,
 
   /**
    * 关键事实块的分档包装：按 `this.difficulty` 决定注入多少推理素材。
-   * - novice：整块返空。AI 没有"关键事件回忆"也没有"立场档案"，逻辑短板会明显暴露，普通人才有胜率。
-   * - standard：keyFacts 只保留最近 3 条；selfDossier 只保留最近 2 轮，够维持基本一致性但不给完美长期记忆。
-   * - expert：满血 baseline。
+   * 具体窗口来自 difficultyProfile，便于离线单测校准。
    */
   private buildKeyFactsBlockByDifficulty(): string {
-    if (this.difficulty === 'novice') return '';
-    if (this.difficulty === 'expert') return this.buildKeyFactsBlock();
+    const profile = getDifficultyProfile(this.difficulty);
+    if (profile.keyFactLimit === 0 && profile.dossierRounds === 0) return '';
+    if (profile.keyFactLimit >= 40 && profile.dossierRounds >= 6) return this.buildKeyFactsBlock();
 
     // standard：裁剪版
     const parts: string[] = [];
     if (this.keyFacts.length > 0) {
-      const recent = this.keyFacts.slice(-3);
+      const recent = this.keyFacts.slice(-profile.keyFactLimit);
       const lines = recent.map((f, i) => `  ${i + 1}. ${f}`).join('\n');
       parts.push(`\n\n【本局已发生的关键事件（务必纳入你的推理）】\n${lines}`);
     }
@@ -1374,7 +1371,7 @@ ${voteJsonHint}`,
       const normalRounds = Array.from(
         new Set(this.selfDossier.filter(d => !d.pinned).map(d => d.round))
       ).sort((a, b) => a - b);
-      const keepFrom = normalRounds.slice(-2)[0] ?? 0;
+      const keepFrom = normalRounds.slice(-profile.dossierRounds)[0] ?? 0;
       const recent = this.selfDossier.filter(d => d.pinned || d.round >= keepFrom);
       if (recent.length > 0) {
         const lines = recent.map(d => `  · ${d.memo}`).join('\n');
@@ -1518,18 +1515,12 @@ ${voteJsonHint}`,
   }
 
   /**
-   * 记忆窗口大小的分档缩放：
-   * - novice：只看最近 4 条 memory，AI"记忆力短"，很多前后矛盾无法察觉。
-   * - standard：base 的 60%（向下取整），保持中等强度。
-   * - expert：base 原值，满血 baseline。
+   * 记忆窗口大小由 difficultyProfile 统一计算，确保三档参数可离线验证为单调梯度。
    *
    * @param base 各调用点原本的窗口大小（-16 / -15 / -12 / -20）；返回的都是正数窗口。
    */
   private memoryWindow(base: number): number {
-    const abs = Math.abs(base);
-    if (this.difficulty === 'novice') return Math.min(4, abs);
-    if (this.difficulty === 'standard') return Math.max(3, Math.floor(abs * 0.6));
-    return abs;
+    return difficultyMemoryWindow(this.difficulty, base);
   }
 
   /**

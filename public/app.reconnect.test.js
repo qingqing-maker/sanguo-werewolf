@@ -214,6 +214,7 @@ function authenticated(data = {}) {
     type: 'authenticated',
     data: {
       sessionId: 's1', seatId: null,
+      isHost: false, isPresentationClient: false, presentationToken: 'P'.repeat(43),
       room: { exists: true, roomId: 'room-1', isCreator: true },
       capabilities: { createRoom: false, closeRoom: true, startGame: true, pauseGame: true, resumeGame: true, restartGame: true },
       state: state(), stateSequence: 0, hasReplay: false, pendingInput: null, ...data,
@@ -259,6 +260,22 @@ async function main() {
     assert.equal(h.sockets.length, 2);
     first.message({ type: 'game_cancelled', data: { gameId: 'g1' }, sequence: 99 });
     assert.equal(h.evaluate('gameStarted'), true, '旧 socket 的迟到消息必须忽略');
+  });
+
+  await check('展示端 WebSocket 断线立即停止本地语音，避免接管页与旧页重叠', async () => {
+    const h = makeHarness();
+    const first = h.sockets[0];
+    first.open();
+    first.message(authenticated({ isHost: true, isPresentationClient: true, state: state('g1', true), stateSequence: 0 }));
+    await flush();
+    h.evaluate('backendTtsAvailable = true');
+    first.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '断线停止' }, sequence: 1 });
+    for (let i = 0; i < 8 && !h.evaluate('currentAudio'); i++) await flush();
+    const audio = h.audioInstances[0];
+    first.close(1006);
+    assert.equal(audio.paused, true, '断线时应调用当前 Audio.pause()');
+    assert.equal(h.evaluate('isPresentationClient'), false, '断线后展示端标记应立即撤销');
+    assert.equal(h.evaluate('presentationToken'), null, '断线后短期展示凭证应立即清空');
   });
 
   await check('活动局重连恢复权威快照、pending，并用 stateSequence 去重', async () => {
@@ -334,7 +351,7 @@ async function main() {
 
   await check('下一名角色的文字等待上一段 TTS 播放结束后才显示', async () => {
     const h = makeHarness(); const socket = h.sockets[0]; socket.open();
-    socket.message(authenticated({ state: state('g1', true), stateSequence: 0 }));
+    socket.message(authenticated({ isHost: true, isPresentationClient: true, state: state('g1', true), stateSequence: 0 }));
     await flush();
     h.evaluate('backendTtsAvailable = true');
     const dialogue = h.document.getElementById('dialogueArea');
@@ -353,12 +370,14 @@ async function main() {
 
   await check('主持人只在当前发言 TTS 结束后发送对应 sequence 回执', async () => {
     const h = makeHarness(); const socket = h.sockets[0]; socket.open();
-    socket.message(authenticated({ isHost: true, state: state('g1', true), stateSequence: 0 }));
+    socket.message(authenticated({ isHost: true, isPresentationClient: true, state: state('g1', true), stateSequence: 0 }));
     await flush();
     h.evaluate('backendTtsAvailable = true');
     socket.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '等待读完' }, sequence: 4 });
     await flush(); await flush();
     assert.equal(socket.sent.some((message) => message.type === 'speech_presented'), false, '播放结束前不得回执');
+    const ttsRequest = h.fetchCalls.find((call) => call.url === '/api/tts');
+    assert.equal(ttsRequest.options.headers['X-Presentation-Token'], 'P'.repeat(43));
     h.audioInstances[0].listeners.ended();
     assert.deepEqual(socket.sent.at(-1), {
       type: 'speech_presented',
@@ -368,7 +387,7 @@ async function main() {
 
   await check('暂停会暂停当前音频，继续后恢复且不会提前回执', async () => {
     const h = makeHarness(); const socket = h.sockets[0]; socket.open();
-    socket.message(authenticated({ isHost: true, state: state('g1', true), stateSequence: 0 }));
+    socket.message(authenticated({ isHost: true, isPresentationClient: true, state: state('g1', true), stateSequence: 0 }));
     await flush();
     h.evaluate('backendTtsAvailable = true');
     socket.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '暂停测试' }, sequence: 1 });
@@ -391,9 +410,10 @@ async function main() {
     ];
     socket.message(authenticated({
       isHost: true,
+      isPresentationClient: true,
       state: state('g1', true),
       stateSequence: 2,
-      speechHistory,
+      publicTimeline: speechHistory,
       pendingPresentationSequence: 2,
     }));
     await flush();
@@ -405,7 +425,7 @@ async function main() {
 
   await check('replay_start 作废在途 TTS，回放对白静音，结束后实时对白恢复', async () => {
     const h = makeHarness(); const socket = h.sockets[0]; socket.open();
-    socket.message(authenticated({ state: state('g1', true), stateSequence: 0 }));
+    socket.message(authenticated({ isHost: true, isPresentationClient: true, state: state('g1', true), stateSequence: 0 }));
     await flush();
     h.evaluate('backendTtsAvailable = true');
     const deferred = h.deferFetch();
@@ -424,6 +444,17 @@ async function main() {
     socket.message({ type: 'player_speak', data: { gameId: 'g2', playerName: 'A', title: '', publicSpeech: '实时' }, sequence: 1 });
     await flush();
     assert.ok(h.fetchCalls.filter((call) => call.url === '/api/tts').length > ttsCallsDuringReplay);
+  });
+
+  await check('非展示标签页只显示文字，不合成 TTS，也不能发送播放回执', async () => {
+    const h = makeHarness(); const socket = h.sockets[0]; socket.open();
+    socket.message(authenticated({ isHost: true, isPresentationClient: false, state: state('g1', true), stateSequence: 0 }));
+    await flush();
+    const before = h.document.getElementById('dialogueArea').children.length;
+    socket.message({ type: 'player_speak', data: { gameId: 'g1', playerName: '甲', title: '', publicSpeech: '只显示' }, sequence: 1 });
+    assert.equal(h.document.getElementById('dialogueArea').children.length, before + 1);
+    assert.equal(h.fetchCalls.filter((call) => call.url === '/api/tts').length, 0);
+    assert.equal(socket.sent.some((message) => message.type === 'speech_presented'), false);
   });
 
   await check('wrong-seat 不污染 pending；拒绝保留、接受清理；提交携带权威标识', async () => {

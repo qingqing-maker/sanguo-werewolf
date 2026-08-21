@@ -49,13 +49,13 @@
             <h2>三国狼人杀</h2>
             <p>十二位三国英雄，暗藏四名细作</p>
             <p>谁是忠臣？谁是奸贼？一切由 AI 定夺</p>
-            <!-- AI 强度：新手 / 标准 / 高阶，观战与参战两种模式都生效 -->
+            <!-- AI 思考强度：控制记忆与策略材料，不承诺阵营胜率 -->
             <div class="difficulty-bar" id="aiDifficultyBar">
-              <span class="difficulty-label">AI 强度</span>
+              <span class="difficulty-label">AI 思考强度</span>
               <div class="difficulty-options">
                 <label class="difficulty-option">
                   <input type="radio" name="aiDifficulty" value="novice" onchange="setAiDifficulty('novice')">
-                  <span>新手</span>
+                  <span>轻量</span>
                 </label>
                 <label class="difficulty-option">
                   <input type="radio" name="aiDifficulty" value="standard" checked onchange="setAiDifficulty('standard')">
@@ -63,10 +63,11 @@
                 </label>
                 <label class="difficulty-option">
                   <input type="radio" name="aiDifficulty" value="expert" onchange="setAiDifficulty('expert')">
-                  <span>高阶</span>
+                  <span>深度</span>
                 </label>
               </div>
-              <p class="difficulty-hint" id="difficultyHint">标准：接近普通玩家水平</p>
+              <p class="difficulty-hint" id="difficultyHint">标准思考：中等记忆、近期关键事实和常规策略</p>
+              <p class="difficulty-hint">说明：双方 AI 会同时增强，档位不保证某个阵营胜率单调变化。</p>
             </div>
             <div class="room-entry" id="roomEntry" style="display:flex; flex-direction:column; align-items:center; gap:10px; margin:14px 0;">
               <p id="roomStatus" class="difficulty-hint">正在连接服务器…</p>

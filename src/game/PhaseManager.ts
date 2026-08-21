@@ -5,6 +5,7 @@ import { ALL_ROLES } from '../roles/Role';
 import { EventPublisher, globalEventBus } from './EventBus';
 import { scalePacingMs } from './pacing';
 import { MathRandomSource, RandomSource } from '../random';
+import { resolveDifficultyMisfireRate } from './difficultyProfile';
 
 /**
  * PhaseManager - 管理游戏各阶段
@@ -14,21 +15,9 @@ import { MathRandomSource, RandomSource } from '../random';
 const VOTE_PACING_MS = 500;         // 单张投票后停顿
 const NIGHT_ACTION_PACING_MS = 300; // 夜晚技能后停顿
 
-/**
- * AI 失误概率配置：让 AI 不再全知全能，偶尔犯"规则允许但策略愚蠢"的错误，更像真人。
- * 注意：这些是**合法**操作（目标存在、在场），只是结果亏——与"保底闸"拦截的非法操作（查死人、
- * 越界 ID）互不冲突。保底闸保证程序不崩，这里保证 AI 会犯错。
- * 均可用 .env 覆盖；留空则用默认值。仅作用于 AI，人类玩家不受影响。
- */
-function misfireRate(envKey: string, def: number): number {
-  const raw = parseFloat(process.env[envKey] || '');
-  if (Number.isFinite(raw) && raw >= 0 && raw <= 1) return raw;
-  return def;
-}
+// AI 的规则内策略失误按“思考强度”形成单调梯度；显式 env 仍可全局覆盖。
 // 预言家：无视"已验记录"重复查验一个查过的玩家（浪费一晚）
-const SEER_REPEAT_RATE = () => misfireRate('MISFIRE_SEER_REPEAT', 0.12);
 // 守卫：无视"不能连守"规则，仍守上一晚同一人 → 当晚守护失效
-const GUARD_REPEAT_RATE = () => misfireRate('MISFIRE_GUARD_REPEAT', 0.12);
 // 注：狼人自刀已从"失误注入"升格为**合法战术**（见 executeWolfVote：非首夜候选池含自己和同伴），
 // 由狼队投票主动选择，不再随机注入，故原 WOLF_SELFKILL_RATE 常量已删除。
 
@@ -469,7 +458,8 @@ export class PhaseManager {
     // 因此放在保底闸之后（否则会被当成非法目标兜底掉）。voided=true 表示技能当晚失效。
     let voided = false;
     if (!agent.isHumanPlayer) {
-      if (agent.player.roleType === RoleType.SEER && this.seerMisfireTriggerRandom.chance(SEER_REPEAT_RATE())) {
+      const difficulty = this.engine.getConfig().aiDifficulty ?? 'standard';
+      if (agent.player.roleType === RoleType.SEER && this.seerMisfireTriggerRandom.chance(resolveDifficultyMisfireRate(difficulty, 'seerRepeat'))) {
         // 预言家失误：无视"已验记录"，重复查验一个查过的存活玩家 → 白白浪费一晚
         const repeatable = agent.getSeerResults()
           .map(r => this.state.players.find(p => p.name === r.name && p.isAlive))
@@ -479,7 +469,7 @@ export class PhaseManager {
           result = { targetId: dup.id, reasoning: '（失误）忘了自己验过，重复查验' };
           console.warn(`  🎲 ${role.name}（${agent.player.name}）失误：重复查验 ${dup.name}，本晚查验被浪费。`);
         }
-      } else if (agent.player.roleType === RoleType.GUARD && this.guardMisfireTriggerRandom.chance(GUARD_REPEAT_RATE())) {
+      } else if (agent.player.roleType === RoleType.GUARD && this.guardMisfireTriggerRandom.chance(resolveDifficultyMisfireRate(difficulty, 'guardRepeat'))) {
         // 守卫失误：无视"不能连守"，仍守上一晚同一人 → 当晚守护失效（voided）
         const last = this.state.lastGuardTarget
           ? this.state.players.find(p => p.id === this.state.lastGuardTarget && p.isAlive)

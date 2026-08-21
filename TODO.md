@@ -27,7 +27,7 @@
 - [x] **转述他人跳预言家被记成本人自跳**：身份声明识别改为只接受第一人称自称，避免假事实在全场记忆中雪球式扩散。
 - [x] **玩家自由文本中的控制标签造成 Prompt 注入旁路**：公开发言和遗言统一通过 `sanitizePlayerContent` 中和半角/全角/混合括号、标签空白以及 system/developer/assistant/user 等伪角色标签；文本仍保持 `user` role 的不可信引用，不宣称字符串清洗能阻止所有自然语言诱导。
 - [x] **LLM 返回中文名、非法 ID 或不存在目标**：所有行动均经过合法目标校验；必要时按姓名匹配，最终才使用合法随机兜底，避免游戏卡死。
-- [x] **AI 难度缺少梯度**：新增 `novice`、`standard`、`expert` 三档；通过策略 prompt、记忆窗口和关键事实注入强度控制，不改变桌游规则。
+- [x] **AI 思考强度缺少可靠梯度**：协议值保留 `novice/standard/expert`，产品名改为轻量/标准/深度；策略、记忆、关键事实和规则内失误率形成可离线断言的单调梯度，不再用阵营胜率承诺“难度”。
 
 ## 三、已修复的 Provider、预算与运行稳定性问题
 
@@ -53,10 +53,14 @@
 - [x] **TTS 失败阻塞游戏**：后端 TTS 失败时前端降级浏览器 `speechSynthesis`；额度耗尽时显示不可误解的提示。
 
 - [x] **主持权改为房间创建者自动获得**：首个打开页面的 session 不自动成为 host；没有房间时，主动创建唯一房间的会话自动成为主持人。服务端只保存 session token 摘要，同 token 可重连同一 session。
-- [x] **TTS 接口缺少成本与滥用边界**：状态/合成接口要求 session Bearer；增加 Unicode 长度、session+IP 请求/字符滑窗、全局并发、有界队列、timeout/abort。火山 TTS 必须显式启用独立字符+调用预算账本，配置缺失 fail-closed。
+- [x] **TTS 接口缺少成本与滥用边界**：状态接口要求 session Bearer，合成接口进一步要求主持人 session；增加 Unicode 长度、session+IP 请求/字符滑窗、全局并发、有界队列、timeout/abort。火山 TTS 必须显式启用独立字符+调用预算账本，配置缺失 fail-closed。
 - [x] **事件重复/倒序产生重复 UI 与漏音**：业务事件使用 gameId+sequence；前端在副作用前去重，EventLog 拒绝非法/重复/倒序 sequence。活动局重连只恢复当前快照、私密座位状态和 pending input，不宣称补齐断线窗口全部事件；无活动局才回放公共历史。
 - [x] **EventBus 实例污染与监听生命周期**：EventBus 可实例化、可注入并返回幂等退订函数；WebServer 默认使用自己的实例并传给 controller/engine。兼容全局实例仍保留，当前仍非多房间架构。
 - [x] **并发开局/重开竞态**：start 在启动、运行或重开中明确 busy；restart 同步占位，先 cancel 并等待旧引擎退出，再创建新代次，第二个并发 start/restart 稳定 busy。
+- [x] **公网主持人离线后永久占房**：最后一个主持人连接断开后进入可配置宽限期；空闲房间到期释放，活动局等结束后释放，重连会取消释放计时。
+- [x] **同一主持人多标签页 TTS 重叠**：服务端维护唯一展示端租约，只有该连接播放和回执；断线后同 token 其他标签页自动接管 pending 发言。
+- [x] **活动局刷新只恢复发言、时间线残缺**：认证快照携带安全公共时间线，恢复阶段/死讯/竞选/投票/放逐/猎人/暂停与降级记录；历史静音，当前状态仍以握手快照为准。
+- [x] **控制命令缺少公网冷却**：WebSocket 与 HTTP 的开局/重开共享冷却，暂停/继续/取消使用短冷却，重复请求返回 `rate_limited`。
 
 ## 五、当前仍需验证或优化的事项
 
@@ -73,7 +77,7 @@
 - [x] 将阶段转移抽为 `PhaseMachine.nextPhase()` 纯函数，并由 `GameEngine.gameLoop()` 接线；
       `npm run test:phase-machine` 验证转移表，`npm run test:phase-seq` 锁定整局事件序列。
 
-### 5.2 AI 难度与公平性
+### 5.2 AI 思考强度与公平性
 
 - [x] 用相同随机种子和相同 Mock Provider 分别跑 `novice/standard/expert`，统计好人胜率、狼人胜率、逐票命中率、平均回合数和错误率。
       → 2026-08-18 固定 `seed=20260817`、默认 12 人、每档 100 局、并发 8；三批配置指纹除 `aiDifficulty` 外一致。
@@ -86,7 +90,7 @@
       结论是三档已具备可重复工程基线，但 `MockProvider` 同时调节好人和狼人能力，不能把单个 seed 的胜率直接解释成严格单调难度；后续需多 seed 或少量受预算保护的真实 Provider 样本验证，不基于这 100 局过拟合调参。
 - [x] 给模拟结果记录模型、难度、prompt 版本、随机种子等，保证结果可追溯。
       → `src/simFingerprint.ts`。每份 `runs/*.jsonl` 的 meta 行现在带 `fingerprint`：
-      prompt 哈希（BaseAgent.ts 内容）、模型 slug/provider/端点主机（不含 API Key）、AI 难度、
+      prompt 哈希（BaseAgent.ts 内容）、模型 slug/provider/端点主机（不含 API Key）、AI 思考强度、
       说话风格开关、三项失误注入率、节奏设置、Node/平台、批次 seed。
       `sim_report.ts` 会打印指纹；传多个文件时用 `diffFingerprints` 列出配置差异，
       并提示"只有当差异正是你想验证的那一项时，胜率对比才有意义"。
@@ -95,7 +99,8 @@
       账本路径白名单脱敏、`batch_summary.completed` 与预算 delta 均有纯离线回归（`npm run test:sim-pool`）。
 - [x] 模拟结果已记录逻辑 `chat/chatJSON` 请求数、最终错误分类、fallback attempt 与决策降级，
       并按 operation 聚合；该分母不包含 Provider 内部 HTTP retry attempt，预算差值也不是云厂商账单。
-- [ ] 评估 AI 失误注入（如重复验人、非法/无效守护、误刀等）是否应该按难度分档，避免新手档只表现为“记忆变短”。
+- [x] AI 规则内失误已按思考强度分档：预言家重复验人与守卫无效连守默认轻量 20%、标准 10%、深度 2%；显式环境变量仍可全局覆盖。`difficultyProfile.test.ts` 零网络验证记忆/事实/策略/失误率梯度。
+- [x] 2026-08-21 完成零 Token 多随机种子 Mock 校准：每档 50 局、连续 seed、0 worker 错误/0 fallback/0 降级；读狼命中为 54.31% / 55.97% / 62.44%，但标准与深度好人胜率同为 54%，因此继续使用“思考强度”而非胜率型难度承诺。
 
 ### 5.3 LLM 与安全边界
 
@@ -136,14 +141,14 @@
 - [x] TTS 服务边界已有独立离线测试：`npm run test:tts` 覆盖 Unicode 长度、session/IP 滑窗、并发/队列、timeout abort、字符+调用预算及失败保守 settle；`npm run test:tts-config` 覆盖付费配置 fail-closed 与只读巡检。
 - [x] 为首次连接、短暂断线、服务器丢局、活动局/公共回放、重复握手、旧 gameId/sequence、
       回放 TTS 静音和 pending input 增加真实 `app.js` Node VM 状态机测试（`npm run test:frontend`）。
-      `authenticated` 现为唯一权威握手，旧 `connected` 只显示消息；WebServer 集成测试另锁定活动局不读历史、
-      公共回放过滤/顺序和 invalid token 的 4002 终止。
+      `authenticated` 现为唯一权威握手，旧 `connected` 只显示消息；WebServer 集成测试另锁定活动局公共时间线过滤、
+      唯一 TTS 展示端接管、空闲房间释放、公共回放顺序和 invalid token 的 4002 终止。
 - [x] 明确事件回放是“观众 UI 恢复”而非“游戏续局”。
       → 回放结束的提示已写明原因：“AI 的记忆只存在于服务器内存里，重启后无法还原，
       因此这局只能回看、不能接着打。”不再让玩家自己猜为什么不能续。
 - [ ] （暂不实现）若将来真要支持续局，需要后端 checkpoint 序列化，而不是靠事件日志倒推。
       设计要点已调研，记录在下方“七、checkpoint 续局设计备忘”，当前判断 ROI 不足：
-      本项目只在本地单机跑、不部署，进程不会滚动重启。
+      当前已部署为 GitHub + Render 免费单实例，但免费实例仍可能休眠、重启或重新部署。
 - [ ] 测试回放期间 `llm_alert`、TTS、旧 gameId 事件过滤和 replay_start/replay_end 顺序。
 - [x] TTS 换局漏音已修复：根因不是"清得不彻底"，而是 `processQueue` 里 `await fetch('/api/tts')` 期间用户换局，那个在途请求无从取消，返回后照样 `new Audio().play()`。改为 `ttsEpoch` 代次令牌，每个 await 边界比对，不匹配即丢弃且不驱动队列（跨代驱动会产生两条并发消费链）。同时补齐 4 个缺失的清理点：`restartGame`（此前完全没清）、`toggleTts` 静音、`onGameStart`（兜底位）、`onReplayStart`。
 - [ ] TTS 仍存边界：`speechSynthesis.cancel()` 在部分浏览器上异步生效，换局瞬间可能有不到一秒残音；仅在回退到浏览器语音时出现，受浏览器实现限制。
@@ -152,9 +157,9 @@
 
 - 服务器重启会丢失后端内存中的 Agent、记忆、暂停状态和 AI 决策上下文；事件日志只能帮助观众回看 UI，不能续局。
 - AI 可能因模型输出不规范、网络错误或规则约束触发合法随机兜底；这属于稳定性保障，不应被当作真实推理结果。
-- AI 难度当前是全局统一档位，不支持一局内给不同座位配置不同难度。
+- AI 思考强度当前是全局统一档位，不支持一局内给不同座位配置不同强度。
 - 统计模拟结果受随机种子、模型版本、prompt 版本和 Provider 错误影响，不能直接等同于“真实人类胜率”。
-- 项目仅在本地运行，不部署到 GitHub 或其他外部服务。
+- 项目当前通过 GitHub + Render 免费单实例部署；不具备账号、多房间、跨实例或跨重启续局能力。
 
 ## 七、checkpoint 续局设计备忘（暂不实现，仅存档调研结论）
 
@@ -248,7 +253,7 @@ interface AgentSnapshot {
 
 ### 7.7 ROI 判断（为何暂不实现）
 
-- 本项目仅本地单机跑、不部署，进程不会滚动重启，续局需求近乎为零（见第六节产品边界）。
+- 当前是公网免费单实例，进程可能休眠或滚动重启；完整 checkpoint 续局仍因改造面较大暂不实现。
 - 阶段级 checkpoint 已能覆盖"崩溃后不想从头再打"的主要诉求，但改造需触碰 GameEngine + BaseAgent + 序列化通道 + 落盘 IO，且要处理阶段内重入幂等，工作量与收益不成比例。
 - 因此当前只归档设计，不动代码。若将来要做，按 7.4 阶段级方案落地，切勿走"扩大 EventLog"的捷径。
 
@@ -277,7 +282,7 @@ interface AgentSnapshot {
 
 ### 8.4 速率限制（防滥用与成本失控）
 
-- 现状：LLM 有 BudgetLedger 全局 token/调用预算；TTS 接口要求 session Bearer，并有 per-session/per-IP 请求数与字符滑窗、并发/队列/timeout，以及火山 TTS 独立字符+调用预算。开局、重开和 `human_input` 仍没有面向公网多租户的用户级冷却或配额。
+- 现状：LLM 有 BudgetLedger 全局 token/调用预算；TTS 合成要求主持人 session，并有 per-session/per-IP 请求数与字符滑窗、并发/队列/timeout，以及火山 TTS 独立字符+调用预算。开局/重开与暂停/继续/取消已有 session 级冷却；`human_input` 仍主要依赖唯一 pending request、座位和 requestId 防重。
 - 方向：网关层或应用层加限流（按 user/IP/room 维度），保护 LLM 与 TTS 成本；开局、重开、消息发送要有冷却与配额；预算从"全局一本账"细化到"按房间/按用户"计量与熔断。
 - 踩点：现有 BudgetLedger 是单例全局账本，多租户下要能按维度切分，否则一个用户能烧光所有人的额度。
 
@@ -289,5 +294,5 @@ interface AgentSnapshot {
 
 ### 8.6 总体判断（为何暂不实现）
 
-- 本项目定位是本地单机玩具，不部署、不对外（第六节产品边界）。上述五项都是"从单机 demo 变成在线服务"才需要的工程化投入，任何一项单独上都会连带重构 WebServer / GameController / EventBus 的核心假设。
-- 因此当前只记录方向，不动代码。真要上线时，建议顺序：先 8.3 房间隔离（架构地基）→ 8.1 数据库（状态落地）→ 8.2 鉴权 →8.4 限流 → 8.5 审计脱敏，逐层加固，而非一次性推倒重来。
+- 当前定位是公网可试玩的免费单实例，而不是互不信任的大规模多人平台。上述数据库、账号、多房间和租户预算仍会连带重构 WebServer / GameController / EventBus 的核心假设。
+- 因此当前只实现单实例必要防护，完整多人化仍按 8.3 房间隔离 → 8.1 数据库 → 8.2 鉴权 → 8.4 多租户限流 → 8.5 审计脱敏逐层推进。

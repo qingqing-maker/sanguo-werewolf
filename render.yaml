@@ -11,6 +11,12 @@ services:
         value: production
       - key: TRUST_PROXY
         value: "1"
+      - key: HOST_DISCONNECT_GRACE_MS
+        value: "90000"
+      - key: CONTROL_COOLDOWN_MS
+        value: "10000"
+      - key: MINOR_CONTROL_COOLDOWN_MS
+        value: "1000"
       - key: DATA_DIR
         value: /var/data
       - key: EVENT_LOG_DIR
