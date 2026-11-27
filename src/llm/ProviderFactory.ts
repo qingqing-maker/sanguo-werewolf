@@ -13,6 +13,15 @@ export function getConfiguredProviderName(): string {
   return (process.env.LLM_PROVIDER || 'mock').trim().toLowerCase();
 }
 
+export function getConfiguredModelName(provider = getConfiguredProviderName()): string {
+  if (provider === 'mock') return 'mock';
+  if (provider === 'gemini') return process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  if (provider === 'anthropic' || provider === 'claude') {
+    return process.env.ANTHROPIC_MODEL || process.env.LLM_MODEL_ID || 'claude-3-5-sonnet-latest';
+  }
+  return process.env.LLM_MODEL_ID || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+}
+
 export function assertProviderConfiguration(
   provider = getConfiguredProviderName(),
   requireReal = false,
@@ -65,14 +74,14 @@ function buildPrimary(
     case 'siliconflow':
     case 'deepseek':
     case 'volcengine':
-      console.log(`[LLM] 使用 ${normalized} (模型: ${process.env.LLM_MODEL_ID || 'gpt-4o-mini'})`);
+      console.log(`[LLM] 使用 ${normalized} (模型: ${getConfiguredModelName(normalized)})`);
       return new OpenAIProvider(breaker, ledger);
     case 'anthropic':
     case 'claude':
-      console.log(`[LLM] 使用 Anthropic (模型: ${process.env.LLM_MODEL_ID || 'claude-3-5-sonnet-latest'})`);
+      console.log(`[LLM] 使用 Anthropic (模型: ${getConfiguredModelName(normalized)})`);
       return new AnthropicProvider(breaker, ledger);
     case 'gemini':
-      console.log(`[LLM] 使用 Gemini (模型: ${process.env.GEMINI_MODEL || 'gemini-2.5-flash'})`);
+      console.log(`[LLM] 使用 Gemini (模型: ${getConfiguredModelName(normalized)})`);
       return new GeminiProvider(breaker, ledger);
     default:
       throw new Error(`不支持的 LLM_PROVIDER: ${normalized}`);

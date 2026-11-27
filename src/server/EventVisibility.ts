@@ -128,7 +128,11 @@ export function projectEventForViewer(input: GameUIEvent, viewer: ViewerContext)
     }
     case 'game_start': {
       const d = source.data;
-      return event(source, source.type, { players: d.players.map(p => projectStartPlayer(p, viewer)) as EventPlayerSnapshot[], config: { ...d.config, roles: [...d.config.roles] } });
+      return event(source, source.type, {
+        players: d.players.map(p => projectStartPlayer(p, viewer)) as EventPlayerSnapshot[],
+        config: { ...d.config, roles: [...d.config.roles] },
+        ...(typeof d.model === 'string' ? { model: d.model } : {}),
+      });
     }
     case 'game_paused': return event(source, source.type, {});
     case 'game_resumed': return event(source, source.type, {});

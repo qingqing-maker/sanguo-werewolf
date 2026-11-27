@@ -1,6 +1,6 @@
 {
   "name": "sanguo-werewolf",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "三国狼人杀 - 多智能体游戏框架",
   "main": "dist/index.js",
   "scripts": {
@@ -48,11 +48,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
-    "@google/genai": "0.11.0",
+    "@google/genai": "3.6.1",
     "dotenv": "16.4.7",
-    "express": "^4.22.2",
-    "msedge-tts": "^2.0.7",
-    "openai": "4.77.0",
+    "express": "^4.22.3",
+    "msedge-tts": "^2.1.1",
+    "openai": "7.65.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {

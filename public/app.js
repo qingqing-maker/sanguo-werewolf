@@ -6,6 +6,8 @@
 let ws = null;
 let gameStarted = false;
 let gamePaused = false;
+let gameStartPending = false;
+let gameCancelPending = false;
 let players = [];
 let currentGameId = null;
 // 是否为断线重连（区分首次打开页面 vs 掉线后自动重连）。
@@ -16,6 +18,8 @@ let hasLoggedDisconnect = false;
 // 回放模式：服务器重启后前端重连时，把历史事件流重放一遍恢复"看到哪了"。
 // 回放期间静音 TTS（否则会把整局语音重播一遍），且不真正驱动游戏控制状态。
 let replaying = false;
+let replayOutcome = null;
+let ignoredReplayGameId = null;
 // 所有业务事件必须在任何 UI/TTS/状态副作用前按 gameId+sequence 过闸。
 // transport 消息不参与；legacy 无 sequence 仍可播放，但无法保证去重。
 const eventSequenceGuard = EventSequence.createEventSequenceGuard();
@@ -81,8 +85,25 @@ function setAiDifficulty(value) {
   if (hint) hint.textContent = AI_DIFFICULTY_HINTS[value];
 }
 
+function renderModelInfo(model) {
+  document.getElementById('modelInfo').textContent = model ? `模型: ${model}` : '';
+}
+
 // 全部 12 个可选人物（与后端 AgentFactory 的 ALL_CHARACTERS 对应）。
-const ALL_CHARACTER_NAMES = ['曹操', '诸葛亮', '张飞', '华佗', '典韦', '刘备', '司马懿', '关羽', '周瑜', '吕布', '貂蝉', '赵云'];
+const CHARACTERS = new Map([
+  ['曹操', { portrait: 'cao-cao', title: '魏武帝' }],
+  ['诸葛亮', { portrait: 'zhuge-liang', title: '卧龙先生' }],
+  ['张飞', { portrait: 'zhang-fei', title: '燕人张翼德' }],
+  ['华佗', { portrait: 'hua-tuo', title: '神医' }],
+  ['典韦', { portrait: 'dian-wei', title: '古之恶来' }],
+  ['刘备', { portrait: 'liu-bei', title: '汉昭烈帝' }],
+  ['司马懿', { portrait: 'sima-yi', title: '冢虎' }],
+  ['关羽', { portrait: 'guan-yu', title: '美髯公' }],
+  ['周瑜', { portrait: 'zhou-yu', title: '美周郎' }],
+  ['吕布', { portrait: 'lv-bu', title: '飞将军' }],
+  ['貂蝉', { portrait: 'diao-chan', title: '闭月' }],
+  ['赵云', { portrait: 'zhao-yun', title: '常山赵子龙' }],
+]);
 
 // ====== TTS 语音模块 ======
 let ttsEnabled = true;
@@ -485,10 +506,12 @@ function connectWebSocket() {
   socket.onclose = (event) => {
     if (generation !== connectionGeneration || socket !== ws) return;
     authenticated = false;
+    gameStartPending = false;
     if (isPresentationClient) stopPendingTts(true, false);
     isPresentationClient = false;
     presentationToken = null;
     clearPendingHumanInput();
+    updateControlButtons();
     isReconnect = true;
     if (event.code === 4002) {
       reconnectStopped = true;
@@ -521,12 +544,25 @@ window.addEventListener('beforeunload', () => {
   connectionGeneration++;
   if (reconnectTimer) clearTimeout(reconnectTimer);
 });
+window.addEventListener('pagehide', saveScrollView);
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 
 // ====== 事件处理 ======
 function handleEvent(msg) {
+  withTimelineEvent(msg, () => processEvent(msg));
+}
+
+function processEvent(msg) {
   // 无版本的历史消息按 v1 处理；未来协议由新版前端接管，当前客户端静默忽略。
   const schemaVersion = msg.schemaVersion ?? 1;
   if (schemaVersion !== 1) return;
+
+  const eventGameId = msg.data?.gameId;
+  // 认证后服务端仍会补发最近的历史记录。留在大厅时跳过整段回放，包括里面的 game_start。
+  if (ignoredReplayGameId && eventGameId === ignoredReplayGameId) {
+    if (msg.type === 'replay_end') ignoredReplayGameId = null;
+    return;
+  }
 
   // 去重和 fail-closed 校验必须早于日志、TTS、DOM 和状态变更。
   if (!eventSequenceGuard.shouldProcess(msg)) return;
@@ -547,7 +583,6 @@ function handleEvent(msg) {
     return;
   }
 
-  const eventGameId = msg.data?.gameId;
   // 旧局的异步请求返回后，丢弃它们，避免旧对白混入新局。
   // 返回欢迎页后 currentGameId 为 null，此时也必须忽略旧局的延迟事件。
   // 回放期间 currentGameId 已被设为回放局的 ID，所以历史事件能正常通过。
@@ -562,9 +597,22 @@ function handleEvent(msg) {
       authenticatedGeneration = connectionGeneration;
       const wasReconnect = isReconnect;
       const believedGameRunning = gameStarted;
-      if (wasReconnect && hasLoggedDisconnect) {
-        addLog('已重新连接到服务器', 'system');
-        hasLoggedDisconnect = false;
+      const didReconnect = wasReconnect && hasLoggedDisconnect;
+      if (didReconnect) hasLoggedDisconnect = false;
+      const state = msg.data.state || null;
+      const serverRunning = !!state?.isRunning;
+      const returnToLobby = gameCancelPending && !serverRunning;
+      gameStartPending = false;
+      gameCancelPending = false;
+      const savedView = scrollViewReady ? { gameId: scrollViewGameId } : readScrollView();
+      const wasInLobby = returnToLobby || (savedView
+        ? savedView.gameId === null
+        : new URLSearchParams(location.search).get('view') === 'lobby');
+      ignoredReplayGameId = !serverRunning && wasInLobby ? msg.data.replayGameId || null : null;
+      const hasReplay = !!msg.data.hasReplay && !ignoredReplayGameId;
+      if (serverRunning || hasReplay) {
+        saveScrollView();
+        scrollViewReady = false;
       }
       authenticated = true;
       void refreshBackendTtsStatus();
@@ -575,14 +623,13 @@ function handleEvent(msg) {
       capabilities = msg.data.capabilities || {};
       roomState = msg.data.room || roomState;
       document.body.classList.toggle('human-mode', !!mySeatId);
-      const state = msg.data.state || null;
-      const serverRunning = !!state?.isRunning;
-      const hasReplay = !!msg.data.hasReplay;
       if (state) {
-        document.getElementById('modelInfo').textContent = `模型: ${state.model}`;
+        renderModelInfo(state.model);
         // 活动局 cursor 先推进到权威值；replay_start 会重置历史局 cursor，从头重建。
         eventSequenceGuard.seed(state.gameId, msg.data.stateSequence);
-        if (serverRunning) {
+        if (returnToLobby) {
+          returnToLobbyAfterCancel();
+        } else if (serverRunning) {
           restoreRunningGame(state);
           restoreActiveTimeline(msg.data.publicTimeline, msg.data.pendingPresentationSequence, state);
           restorePrivateSnapshot(msg.data.privateSnapshot);
@@ -590,12 +637,14 @@ function handleEvent(msg) {
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
         } else if (!hasReplay) {
-          currentGameId = state.gameId || null;
+          currentGameId = ignoredReplayGameId ? null : state.gameId || null;
         }
         // hasReplay=true 时不改写当前历史状态，等待紧随其后的 replay_start 接管。
       }
       if (msg.data.pendingInput && serverRunning) showHumanInputPanel(msg.data.pendingInput);
       updateControlButtons();
+      if (didReconnect) addLog('已重新连接到服务器', 'system');
+      if (!hasReplay && !scrollViewReady) restoreScrollView(serverRunning ? state.gameId : null);
       isReconnect = false;
       break;
     }
@@ -746,6 +795,11 @@ function handleEvent(msg) {
     case 'game_cancelled':
       clearPendingHumanInput();
       stopPendingTts();
+      if (gameCancelPending && !replaying) {
+        returnToLobbyAfterCancel();
+        break;
+      }
+      if (replaying) replayOutcome = 'cancelled';
       currentGameId = null;
       gameStarted = false;
       gamePaused = false;
@@ -767,13 +821,163 @@ function handleEvent(msg) {
         addLog(`输入未接受: ${msg.data.reason || 'stale_request'}`, 'system');
       }
       break;
-    case 'error':
+    case 'error': {
+      if (gameStartPending || gameCancelPending) {
+        const action = gameStartPending ? '开局' : '结束对局';
+        const reason = msg.data.reason === 'rate_limited'
+          ? `操作过快，请在 ${msg.data.retryAfterSeconds || 1} 秒后重试。`
+          : msg.data.reason === 'busy'
+            ? '上一局还在结束，请稍后重试。'
+            : '操作未获服务端接受，详情见事件日志。';
+        gameStartPending = false;
+        gameCancelPending = false;
+        updateControlButtons();
+        showToast(`${action}失败`, reason, 'warn');
+      }
       addLog(`错误: ${msg.data.message || msg.data.reason}`, 'system');
       break;
+    }
   }
 }
 
 // ====== 游戏控制 ======
+const SCROLL_VIEW_KEY = 'sanguo-scroll-view';
+const SCROLL_PANES = ['dialogueArea', 'eventLog', 'playerList', 'page'];
+let scrollViewGameId = null;
+let scrollViewReady = false;
+let scrollSequence = null;
+let timelineTimestamp = null;
+let pendingScrollRestore = null;
+
+function withTimelineEvent(event, render) {
+  const previousSequence = scrollSequence;
+  const previousTimestamp = timelineTimestamp;
+  scrollSequence = event.sequence;
+  timelineTimestamp = event.timestamp;
+  try {
+    render();
+  } finally {
+    scrollSequence = previousSequence;
+    timelineTimestamp = previousTimestamp;
+  }
+}
+
+function getScrollPane(id) {
+  return id === 'page' ? document.scrollingElement : document.getElementById(id);
+}
+
+function followsLatest(id) {
+  return id === 'dialogueArea' || id === 'eventLog';
+}
+
+function isAtScrollEnd(pane) {
+  return pane.scrollHeight - pane.clientHeight - pane.scrollTop <= 4;
+}
+
+function captureScrollPane(pane, followLatest) {
+  const position = { top: pane.scrollTop, left: pane.scrollLeft };
+  if (!followLatest) return position;
+  position.atEnd = isAtScrollEnd(pane);
+  if (position.atEnd) return position;
+
+  const top = pane.getBoundingClientRect().top + pane.clientTop;
+  const bottom = top + pane.clientHeight;
+  const entries = Array.from(pane.querySelectorAll('[data-event-sequence]'));
+  const entry = entries.find(node => {
+    const rect = node.getBoundingClientRect();
+    return rect.bottom > top && rect.top < bottom;
+  });
+  if (entry) {
+    const sequence = entry.dataset.eventSequence;
+    const index = entries.filter(node => node.dataset.eventSequence === sequence).indexOf(entry);
+    position.anchor = { sequence: Number(sequence), index, offset: entry.getBoundingClientRect().top - top };
+  }
+  return position;
+}
+
+function saveScrollView() {
+  if (!scrollViewReady) return;
+  try {
+    const panes = {};
+    for (const id of SCROLL_PANES) {
+      const pane = getScrollPane(id);
+      if (pane) panes[id] = captureScrollPane(pane, followsLatest(id));
+    }
+    const viewingRecap = !!document.querySelector('#restartFloatBtn');
+    sessionStorage.setItem(SCROLL_VIEW_KEY, JSON.stringify({ gameId: scrollViewGameId, panes, viewingRecap }));
+  } catch (_) { /* 滚动位置仅在浏览器允许会话存储时保存。 */ }
+}
+
+function readScrollView() {
+  try {
+    return JSON.parse(sessionStorage.getItem(SCROLL_VIEW_KEY));
+  } catch (_) {
+    return null;
+  }
+}
+
+function restoreScrollView(gameId) {
+  scrollViewGameId = gameId || null;
+  const storedView = readScrollView();
+  const saved = storedView?.gameId === scrollViewGameId ? storedView : null;
+
+  if (saved?.viewingRecap && document.getElementById('gameEndModal')?.style.display === 'flex') {
+    closeModal();
+    showRestartButton();
+  }
+  applyScrollPositions(saved?.panes);
+  scrollViewReady = true;
+
+  pendingScrollRestore?.abort();
+  if (document.fonts) {
+    // 字体载入可能改变发言的换行和高度。用户继续操作时，以用户的位置为准。
+    const pending = new AbortController();
+    pendingScrollRestore = pending;
+    const cancel = () => pending.abort();
+    for (const type of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
+      window.addEventListener(type, cancel, { capture: true, passive: true, signal: pending.signal });
+    }
+    void document.fonts.ready.then(() => requestAnimationFrame(() => {
+      if (!pending.signal.aborted && scrollViewReady) applyScrollPositions(saved?.panes);
+      pending.abort();
+    }));
+  }
+}
+
+function applyScrollPositions(positions) {
+  for (const id of SCROLL_PANES) {
+    const pane = getScrollPane(id);
+    if (!pane) continue;
+    const position = positions?.[id];
+    if (followsLatest(id) && (position?.atEnd || (!position && scrollViewGameId))) {
+      pane.scrollTop = pane.scrollHeight;
+      continue;
+    }
+    pane.scrollLeft = position?.left ?? 0;
+    let top = position?.top ?? 0;
+    const anchor = position?.anchor;
+    if (Number.isSafeInteger(anchor?.sequence)) {
+      const entry = pane.querySelectorAll(`[data-event-sequence="${anchor.sequence}"]`)[anchor.index];
+      if (entry) {
+        const offset = entry.getBoundingClientRect().top - pane.getBoundingClientRect().top - pane.clientTop;
+        top = pane.scrollTop + offset - anchor.offset;
+      }
+    }
+    pane.scrollTop = top;
+  }
+}
+
+function appendTimelineEntry(pane, entry, sequence = scrollSequence, parent = pane) {
+  const follow = scrollViewReady && isAtScrollEnd(pane);
+  if (!scrollViewReady && pane.id === 'dialogueArea') {
+    (parent === pane ? entry : parent).classList.add('timeline-restored');
+  }
+  if (Number.isSafeInteger(sequence) && sequence > 0) entry.dataset.eventSequence = String(sequence);
+  parent.appendChild(entry);
+  if (parent !== pane && !parent.parentNode) pane.appendChild(parent);
+  if (follow) pane.scrollTop = pane.scrollHeight;
+}
+
 function clearGameDialogue() {
   const dialogueArea = document.getElementById('dialogueArea');
   if (!dialogueArea) return;
@@ -782,8 +986,10 @@ function clearGameDialogue() {
   }
 }
 
-function enterGameView() {
+function enterGameView(title = '对局现场') {
   clearGameDialogue();
+  document.body.classList.remove('lobby-view');
+  document.getElementById('stageTitle').textContent = title;
   const welcomePanel = document.getElementById('welcomePanel');
   if (welcomePanel) welcomePanel.style.display = 'none';
 }
@@ -834,17 +1040,22 @@ function stopPendingTts(showQueuedMessages = false, acknowledgeQueuedMessages = 
 function resetToWelcome() {
   gameStarted = false;
   gamePaused = false;
+  gameStartPending = false;
+  gameCancelPending = false;
   players = [];
   currentGameId = null;
   humanCharacterName = null;
   mySeatId = null;
   replaying = false;
+  scrollViewGameId = null;
+  pendingScrollRestore?.abort();
   presentationSpeechBySequence.clear();
   queuedPresentationSequences.clear();
   clearPendingHumanInput();
 
   stopPendingTts();
   document.body.classList.remove('human-mode');
+  document.body.classList.add('lobby-view');
   clearGameDialogue();
 
   // 回到欢迎页时收起顶栏的"当前局"标签，下一局 game_start 再按新难度显示。
@@ -889,8 +1100,7 @@ function resetToWelcome() {
   const btnRestart = document.getElementById('btnRestart');
   if (btnRestart) btnRestart.style.display = '';
 
-  const playerList = document.getElementById('playerList');
-  if (playerList) playerList.innerHTML = '<div class="empty-state">等待游戏开始...</div>';
+  renderLobbyRoster();
   const humanInputPanel = document.getElementById('humanInputPanel');
   if (humanInputPanel) humanInputPanel.style.display = 'none';
   const inputOptions = document.getElementById('inputOptions');
@@ -908,33 +1118,32 @@ function resetToWelcome() {
     const status = ws && ws.readyState === WebSocket.OPEN ? '已连接到服务器' : '等待连接服务器...';
     eventLog.innerHTML = `<div class="log-entry log-system">${status}</div>`;
   }
+  for (const id of SCROLL_PANES) {
+    const pane = getScrollPane(id);
+    if (!pane) continue;
+    pane.scrollTop = 0;
+    pane.scrollLeft = 0;
+  }
+  scrollViewReady = true;
+  saveScrollView();
 }
 
 // 观战模式：全 AI，不带 humanCharacterName。
 function startGame() {
-  clearPendingHumanInput();
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    humanCharacterName = null;
-    mySeatId = null;
-    // 观战模式也带上 AI 强度档位，让全 AI 局也能选难度。
-    ws.send(JSON.stringify({ type: 'start_game', config: { aiDifficulty } }));
-    addLog('正在启动游戏...', 'system');
-    const btnStart = document.getElementById('btnStart');
-    if (btnStart) btnStart.disabled = true;
-  }
+  startGameAsPlayer(null);
 }
 
 // 参战模式：把选定人物名并入 config，后端据此强制该人物入局并标记为人类座位。
 function startGameAsPlayer(name) {
+  if (!authenticated || !capabilities.startGame || gameStarted || gameStartPending || ws?.readyState !== WebSocket.OPEN) return;
   clearPendingHumanInput();
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    humanCharacterName = name;
-    mySeatId = null; // 座位 id 要等 game_start 才知道（后端随机分配 player_i）
-    ws.send(JSON.stringify({ type: 'start_game', config: { humanCharacterName: name, aiDifficulty } }));
-    addLog(`正在以「${name}」身份加入游戏...`, 'system');
-    const btn = document.getElementById('btnStart');
-    if (btn) btn.disabled = true;
-  }
+  humanCharacterName = name;
+  mySeatId = null;
+  gameStartPending = true;
+  const config = name ? { humanCharacterName: name, aiDifficulty } : { aiDifficulty };
+  ws.send(JSON.stringify({ type: 'start_game', config }));
+  addLog(name ? `正在以「${name}」身份加入游戏...` : '正在启动游戏…', 'system');
+  updateControlButtons();
 }
 
 function showCharacterPicker() {
@@ -943,18 +1152,22 @@ function showCharacterPicker() {
   picker.style.display = 'block';
   const grid = document.getElementById('characterGrid');
   grid.innerHTML = '';
-  for (const name of ALL_CHARACTER_NAMES) {
+  for (const [name, character] of CHARACTERS) {
     const btn = document.createElement('button');
+    btn.type = 'button';
     btn.className = 'character-choice';
-    btn.innerHTML = `<span class="cc-emoji">${getCharacterEmoji(name)}</span><span class="cc-name">${name}</span>`;
+    btn.append(createCharacterAvatar(name), createCharacterLabel(name, character.title));
     btn.onclick = () => startGameAsPlayer(name);
     grid.appendChild(btn);
   }
+  picker.scrollIntoView({ block: 'nearest' });
+  grid.firstElementChild?.focus({ preventScroll: true });
 }
 
 function hideCharacterPicker() {
   document.getElementById('characterPicker').style.display = 'none';
   document.getElementById('modeSelect').style.display = 'flex';
+  document.getElementById('btnJoin').focus();
 }
 
 function pauseGame() {
@@ -974,18 +1187,18 @@ function resumeGame() {
 // 因为玩家常常在游戏中途想换个档位试试，直接原地重开就没有选档的入口。
 // 结束页那颗按钮也走同一套 resetToWelcome，两处入口语义统一。
 function restartGame() {
-  // 对局进行中给一次确认，避免误点丢掉正在跑的局；对局已结束时直接回欢迎页。
-  if (gameStarted && !confirm('确定要结束当前对局并回到选局页面吗？当前进度会作废。')) {
+  if (gameStarted) {
+    if (!authenticated || !capabilities.cancelGame || gameCancelPending || ws?.readyState !== WebSocket.OPEN) return;
+    if (!confirm('确定要结束当前对局并回到选局页面吗？当前进度会作废。')) return;
+    gameCancelPending = true;
+    ws.send(JSON.stringify({ type: 'cancel_game' }));
+    updateControlButtons();
     return;
   }
-  // 关键：作废上一局的语音（含在途 fetch）。stopPendingTts 在 resetToWelcome 里也会调，
-  // 这里提前调一次是为了先把 currentAudio 掐掉，避免确认弹窗期间还在播上一句。
-  stopPendingTts();
-  // 告诉后端停掉当前引擎；不发 restart_game（那是"立即用同档开新局"，与本按钮语义相反）。
-  if (ws && ws.readyState === WebSocket.OPEN && gameStarted) {
-    ws.send(JSON.stringify({ type: 'cancel_game' }));
-  }
-  currentGameId = null;
+  resetToWelcome();
+}
+
+function returnToLobbyAfterCancel() {
   resetToWelcome();
   addLog('已结束当前对局，请重新选择难度和模式', 'system');
 }
@@ -1158,9 +1371,10 @@ function updateRoomControls() {
   }
   if (closeBtn) {
     closeBtn.style.display = authenticated && roomState.isCreator && !gameStarted ? 'inline-flex' : 'none';
-    closeBtn.disabled = !capabilities.closeRoom;
+    closeBtn.disabled = !capabilities.closeRoom || gameStartPending;
   }
-  if (modeSelect && !gameStarted) modeSelect.style.display = roomState.isCreator ? 'flex' : 'none';
+  const pickerOpen = document.getElementById('characterPicker').style.display === 'block';
+  if (modeSelect) modeSelect.style.display = roomState.isCreator && !gameStarted && !pickerOpen ? 'flex' : 'none';
   if (settingsBtn) settingsBtn.style.display = roomState.isCreator ? 'inline-flex' : 'none';
   if (status) {
     if (!authenticated) status.textContent = '正在连接服务器…';
@@ -1171,21 +1385,22 @@ function updateRoomControls() {
 }
 
 function updateControlButtons() {
-  const startBtn = document.getElementById('btnStart');
-  if (startBtn) startBtn.disabled = !authenticated || !capabilities.startGame || gameStarted;
-  const joinBtn = document.getElementById('btnJoin');
-  if (joinBtn) joinBtn.disabled = !authenticated || !capabilities.startGame || gameStarted;
+  const startDisabled = !authenticated || !capabilities.startGame || gameStarted || gameStartPending;
+  document.getElementById('btnStart').disabled = startDisabled;
+  document.getElementById('btnJoin').disabled = startDisabled;
+  for (const choice of document.getElementById('characterGrid').children) choice.disabled = startDisabled;
   const pauseBtn = document.getElementById('btnPause');
   const resumeBtn = document.getElementById('btnResume');
-  if (pauseBtn) pauseBtn.disabled = !capabilities.pauseGame;
-  if (resumeBtn) resumeBtn.disabled = !capabilities.resumeGame;
-  if (gamePaused) {
-    pauseBtn.style.display = 'none';
-    resumeBtn.style.display = 'inline-flex';
-  } else {
-    pauseBtn.style.display = 'inline-flex';
-    resumeBtn.style.display = 'none';
-  }
+  const restartBtn = document.getElementById('btnRestart');
+  const live = gameStarted && !replaying;
+  pauseBtn.style.display = live && !gamePaused && capabilities.pauseGame ? '' : 'none';
+  resumeBtn.style.display = live && gamePaused && capabilities.resumeGame ? '' : 'none';
+  pauseBtn.disabled = resumeBtn.disabled = !authenticated || gameCancelPending;
+  const inRecap = document.getElementById('gameEndModal').style.display === 'flex' || document.querySelector('#restartFloatBtn');
+  restartBtn.style.display = (live && capabilities.cancelGame) || (!gameStarted && !replaying && !inRecap) ? '' : 'none';
+  restartBtn.disabled = live && (!authenticated || gameCancelPending);
+  restartBtn.textContent = gameCancelPending ? '正在结束…' : live ? '再来一局' : '返回大厅';
+  restartBtn.title = live ? '结束当前对局并返回大厅' : '返回大厅';
   updateRoomControls();
 }
 
@@ -1216,7 +1431,10 @@ function showHumanInputPanel(data) {
       const label = player ? player.name : (id === 'abstain' ? '弃票' : id);
       const btn = document.createElement('button');
       btn.className = 'btn-option';
-      btn.textContent = label;
+      if (player) btn.appendChild(createCharacterAvatar(player.name));
+      const optionLabel = document.createElement('span');
+      optionLabel.textContent = label;
+      btn.appendChild(optionLabel);
       btn.onclick = () => submitHumanChoice(id);
       options.appendChild(btn);
     }
@@ -1289,6 +1507,8 @@ function submitHumanText(allowEmpty) {
 // 新客户端连上时按序补发，这里把它们当普通事件走一遍渲染流程，恢复"看到哪了"。
 // 回放期间静音 TTS（replaying=true），并显示横幅告知这是历史记录、非直播。
 function onReplayStart(data) {
+  saveScrollView();
+  scrollViewReady = false;
   // 回放必须从头扫描历史来重建 cursor，不能沿用握手或此前实时流留下的进度。
   eventSequenceGuard.resetGame(data.gameId);
   // replaying=true 只能拦住"还没入队"的新语音（speakText 开头就 return）。
@@ -1296,33 +1516,33 @@ function onReplayStart(data) {
   // 否则回放开始时会突然冒出一句上一局的语音。
   stopPendingTts();
   replaying = true;
+  replayOutcome = null;
+  closeModal();
+  document.getElementById('restartFloatBtn')?.remove();
   // 让被 gameId 过滤器放行：把当前局设为回放局的 ID
   currentGameId = data.gameId || null;
   gameStarted = true;
-  enterGameView();
-  addSystemMessage(`📜 正在回放上一局记录（服务器已重启，这是历史对局，非实时）…`);
+  enterGameView('历史回放');
+  document.getElementById('controlBtns').style.display = 'flex';
+  updateControlButtons();
+  document.getElementById('eventLog').textContent = '';
+  addSystemMessage('📜 正在载入上一局的历史记录…');
   addLog(`回放历史对局（${data.count} 条事件）`, 'system');
 }
 
 function onReplayEnd(data) {
   replaying = false;
-  // 历史事件可能止于中途而没有 game_end；回放结束本身就是“该局不再活动”的权威边界。
   gameStarted = false;
   gamePaused = false;
   currentGameId = null;
-  // 说清"为什么不能续"，否则玩家看完回放会以为是 bug。
-  // 事件日志只记录了"对外可见的结果"（谁发言了、谁被投出），
-  // 而每个 AI 的记忆、心证、女巫药剂状态、预言家验人记录都在后端内存里，随进程一起没了。
-  addSystemMessage(
-    `📜 历史回放结束。这是磁盘上的事件记录，不是直播。<br>` +
-    `该局在服务器重启时已中断且<strong>无法续接</strong>——回放只能恢复"看到过什么"，` +
-    `但每个 AI 的记忆与推理状态存在后端内存里，随进程一起丢失了。点右上角的「🔄 再来一局」可开新的一局。`
-  );
-  addLog('回放结束（该局无法续接）', 'system');
-  // 回放的是已中断的局，不能继续，允许直接开新局
-  const btnStart = document.getElementById('btnStart');
-  if (btnStart) btnStart.disabled = false;
+  const outcome = replayOutcome === 'completed' ? '本局已结算。'
+    : replayOutcome === 'cancelled' ? '本局已提前结束。'
+      : '本局记录止于中途，可返回大厅。';
+  addSystemMessage(`📜 回放结束。${outcome}`);
+  addLog(`回放结束。${outcome}`, 'system');
+  replayOutcome = null;
   updateControlButtons();
+  restoreScrollView(data.gameId);
 }
 
 // 断线重连后发现服务器已无进行中的对局、也没有可回放的历史（例如服务器重启且日志被清）。
@@ -1366,6 +1586,7 @@ function restoreRunningGame(state) {
   document.body.classList.toggle('human-mode', !!mySeatId);
 
   enterGameView();
+  document.getElementById('eventLog').textContent = '';
   renderPlayerList(state.players);
   applyAuthoritativeRunningState(state);
 }
@@ -1388,17 +1609,8 @@ function applyAuthoritativeRunningState(state) {
     }
   }
 
-  // 恢复控制按钮组（暂停/继续/重开/语音）。按暂停状态切换暂停/继续可见性。
-  const controlBtns = document.getElementById('controlBtns');
-  if (controlBtns) controlBtns.style.display = 'flex';
-  const btnPause = document.getElementById('btnPause');
-  const btnResume = document.getElementById('btnResume');
-  const btnRestart = document.getElementById('btnRestart');
-  if (btnPause) btnPause.style.display = gamePaused ? 'none' : '';
-  if (btnResume) btnResume.style.display = gamePaused ? '' : 'none';
-  if (btnRestart) btnRestart.style.display = '';
-  const btnStart = document.getElementById('btnStart');
-  if (btnStart) btnStart.disabled = true;
+  document.getElementById('controlBtns').style.display = 'flex';
+  updateControlButtons();
 }
 
 /**
@@ -1414,7 +1626,7 @@ function restoreActiveTimeline(timeline, pendingSequence, state) {
   try {
     for (const event of timeline) {
       if (!event) continue;
-      renderActiveTimelineEvent(event);
+      withTimelineEvent(event, () => renderActiveTimelineEvent(event));
     }
   } finally {
     activeTimelineRestoring = false;
@@ -1490,9 +1702,13 @@ function onGameStart(data) {
   presentationSpeechBySequence.clear();
   queuedPresentationSequences.clear();
   currentGameId = data.gameId || null;
+  gameStartPending = false;
+  gameCancelPending = false;
+  scrollViewReady = false;
   gameStarted = true;
   gamePaused = false;
   players = data.players;
+  if (typeof data.model === 'string' || replaying) renderModelInfo(data.model);
 
   // 顶栏显示本局 AI 强度（新人/标准/高阶）。难度随 game_start 的 config 下发，
   // 每局可变，故在这里读而非连接握手。缺失时 updateDifficultyBadge 兜底为标准。
@@ -1504,16 +1720,14 @@ function onGameStart(data) {
   // 座位身份只由 authenticated 消息中的服务端绑定决定；game_start 不得自行推断或清空。
   document.body.classList.toggle('human-mode', !!mySeatId);
 
-  enterGameView();
+  if (!replaying) {
+    closeModal();
+    document.getElementById('restartFloatBtn')?.remove();
+    enterGameView();
+  }
 
   renderPlayerList(data.players);
   document.getElementById('controlBtns').style.display = 'flex';
-  // 新局开始时恢复被 onGameEnd 隐藏的三个按钮。
-  document.getElementById('btnPause').style.display = '';
-  document.getElementById('btnResume').style.display = 'none'; // 初始为暂停可用状态
-  document.getElementById('btnRestart').style.display = '';
-  const btnStart = document.getElementById('btnStart');
-  if (btnStart) btnStart.disabled = true;
 
   if (mySeatId) {
     const me = data.players.find(p => p.id === mySeatId);
@@ -1531,6 +1745,8 @@ function onGameStart(data) {
   // 放在 game_start 而非 resetToWelcome：所有开局路径（新开/参战/重开）都必经这里。
   degradeSeen.clear();
   addLog('游戏开始', 'system');
+  updateControlButtons();
+  if (!replaying) restoreScrollView(currentGameId);
 }
 
 function onPhaseChange(data) {
@@ -1604,7 +1820,8 @@ function onSheriffFinalSpeech(data, sequence) {
   // 警长归票发言用特殊样式显示
   const speechData = {
     playerId: data.sheriffId,
-    playerName: `🏅 警长${data.sheriffName}`,
+    playerName: data.sheriffName,
+    displayName: `🏅 警长${data.sheriffName}`,
     title: '归票发言',
     innerThoughts: data.innerThoughts || '',
     publicSpeech: data.speech,
@@ -1628,7 +1845,8 @@ function onSheriffElectionStart(data) {
 function onSheriffSpeech(data, sequence) {
   const speechData = {
     playerId: data.playerId,
-    playerName: `🏅 ${data.playerName}`,
+    playerName: data.playerName,
+    displayName: `🏅 ${data.playerName}`,
     title: '竞选演说',
     innerThoughts: '',
     publicSpeech: data.speech,
@@ -1676,7 +1894,8 @@ function onSheriffElectionEnd(data) {
 function onSheriffPkSpeech(data, sequence) {
   const speechData = {
     playerId: data.playerId,
-    playerName: `⚔️ ${data.playerName}`,
+    playerName: data.playerName,
+    displayName: `⚔️ ${data.playerName}`,
     title: 'PK发言',
     innerThoughts: '',
     publicSpeech: data.speech,
@@ -1728,14 +1947,11 @@ function onHunterShoot(data) {
 function onGameEnd(data) {
   gameStarted = false;
   gamePaused = false;
-  // 复盘阶段：隐藏暂停/继续/重开，但保留语音键（此时仍有 TTS 在播放）
-  document.getElementById('btnPause').style.display = 'none';
-  document.getElementById('btnResume').style.display = 'none';
-  document.getElementById('btnRestart').style.display = 'none';
-  // controlBtns 容器保持显示，让"语音"按钮可见
+  gameCancelPending = false;
+  if (replaying) replayOutcome = 'completed';
 
   const isGoodWin = data.winner === 'good';
-  const winnerText = isGoodWin ? '🟢 好人阵营胜利！' : '🔴 狼人阵营胜利！';
+  const winnerText = isGoodWin ? '好人阵营胜利！' : '狼人阵营胜利！';
 
   addSystemMessage(`🏆 ${winnerText}`);
   addLog(`游戏结束 - ${winnerText}`, 'system');
@@ -1753,7 +1969,7 @@ function onGameEnd(data) {
   reason.textContent = String(data.reason ?? '');
   body.appendChild(reason);
   const reveal = document.createElement('div');
-  reveal.style.textAlign = 'left';
+  reveal.className = 'reveal-grid';
   const roleNames = {
     werewolf: '细作（狼人）', seer: '军师（预言家）',
     witch: '神医（女巫）', hunter: '猛将（猎人）',
@@ -1762,20 +1978,64 @@ function onGameEnd(data) {
   for (const p of data.players) {
     const item = document.createElement('div');
     item.className = 'reveal-item';
-    const icon = p.faction === 'wolf' ? '🐺' : '😇';
-    const status = p.isAlive ? '✅' : '❌';
-    item.textContent = `${status} ${icon} ${p.name}（${p.title}）- ${roleNames[p.roleType] || p.roleType}`;
+    const status = p.isAlive ? '存活' : '出局';
+    item.classList.add(p.faction === 'wolf' ? 'wolf' : 'good');
+    item.append(
+      createCharacterAvatar(p.name),
+      createCharacterLabel(p.name, `${roleNames[p.roleType] || p.roleType} · ${status}`),
+    );
     reveal.appendChild(item);
   }
   body.appendChild(reveal);
   modal.style.display = 'flex';
 
   revealAllRoles(data.players);
-  const btnStart = document.getElementById('btnStart');
-  if (btnStart) btnStart.disabled = false;
+  updateControlButtons();
 }
 
 // ====== 渲染函数 ======
+function createCharacterAvatar(name) {
+  const avatar = document.createElement('span');
+  avatar.className = 'character-avatar';
+  avatar.ariaHidden = 'true';
+  avatar.textContent = String(name || '·').slice(0, 1);
+
+  const portrait = CHARACTERS.get(name)?.portrait;
+  if (portrait) {
+    const image = document.createElement('img');
+    image.src = `images/portraits/${portrait}.webp`;
+    image.alt = '';
+    image.decoding = 'async';
+    image.addEventListener('error', () => image.remove(), { once: true });
+    avatar.appendChild(image);
+  }
+  return avatar;
+}
+
+function createCharacterLabel(name, title) {
+  const label = document.createElement('span');
+  label.className = 'player-info';
+  const nameText = document.createElement('span');
+  nameText.className = 'player-name';
+  nameText.textContent = name;
+  const titleText = document.createElement('span');
+  titleText.className = 'player-title';
+  titleText.textContent = title;
+  label.append(nameText, titleText);
+  return label;
+}
+
+function renderLobbyRoster() {
+  const list = document.getElementById('playerList');
+  list.innerHTML = '';
+  for (const [name, character] of CHARACTERS) {
+    const card = document.createElement('div');
+    card.className = 'player-card';
+    card.append(createCharacterAvatar(name), createCharacterLabel(name, character.title));
+    list.appendChild(card);
+  }
+}
+
 function renderPlayerList(playerData) {
   const list = document.getElementById('playerList');
   list.innerHTML = '';
@@ -1803,26 +2063,28 @@ function renderPlayerList(playerData) {
     const factionClass = (known || isWolfPartner) ? (visibleRoleType === 'werewolf' ? 'wolf' : 'good') : 'unknown';
 
     // 合规：非"你"的座位一律显式标注为 AI 角色（不可关闭）
-    const identityTag = isMe
-      ? '<span class="me-tag">你</span>'
-      : '<span class="ai-tag" title="该角色为人工智能，并非真人玩家">🤖 AI</span>';
-    card.innerHTML = `
-      <div class="player-avatar">${getCharacterEmoji(p.name)}</div>
-      <div class="player-info">
-        <div class="player-name">${p.name} ${identityTag}${isWolfPartner ? '<span class="wolf-partner-tag">🐺队友</span>' : ''}</div>
-        <div class="player-title">${p.title}</div>
-      </div>
-      <span class="player-role ${(known || isWolfPartner) ? 'revealed' : 'hidden-role'} ${factionClass}" id="role-${p.id}">${roleText}</span>
-    `;
+    const label = createCharacterLabel(p.name, p.title);
+    const identityTag = document.createElement('span');
+    identityTag.className = isMe ? 'me-tag' : 'ai-tag';
+    identityTag.textContent = isMe ? '你' : 'AI';
+    if (!isMe) identityTag.title = '该角色为人工智能，并非真人玩家';
+    label.children[0].appendChild(identityTag);
+    if (isWolfPartner) {
+      const partnerTag = document.createElement('span');
+      partnerTag.className = 'wolf-partner-tag';
+      partnerTag.textContent = '队友';
+      label.children[0].appendChild(partnerTag);
+    }
+    const role = document.createElement('span');
+    role.className = `player-role ${(known || isWolfPartner) ? 'revealed' : 'hidden-role'} ${factionClass}`;
+    role.id = `role-${p.id}`;
+    role.textContent = roleText;
+    card.append(createCharacterAvatar(p.name), label, role);
     if (known || isWolfPartner) card.classList.add(factionClass);
     if (isMe) card.classList.add('my-seat');
+    if (p.isAlive === false) card.classList.add('dead');
     list.appendChild(card);
   }
-}
-
-function getCharacterEmoji(name) {
-  const map = { '曹操':'👑', '诸葛亮':'🪶', '张飞':'🔥', '华佗':'💊', '典韦':'🛡️', '司马懿':'🦊', '关羽':'⚔️', '刘备':'🏯', '周瑜':'🔥', '吕布':'🐎', '貂蝉':'🌸', '赵云':'🗡️' };
-  return map[name] || '🎭';
 }
 
 function markPlayerDead(playerId) {
@@ -1839,9 +2101,10 @@ function revealAllRoles(playerData) {
     if (card && roleSpan) {
       roleSpan.textContent = roleIcons[p.roleType] || p.roleType;
       // 终局全揭示：把参战模式下遮掉的座位从「？」中性态翻成已揭示态。
+      const faction = p.faction === 'wolf' ? 'wolf' : 'good';
       roleSpan.classList.remove('hidden-role', 'unknown');
-      roleSpan.classList.add('revealed');
-      card.classList.add(p.faction === 'wolf' ? 'wolf' : 'good');
+      roleSpan.classList.add('revealed', faction);
+      card.classList.add(faction);
     }
   }
 }
@@ -1854,8 +2117,7 @@ function addSystemMessage(text, extraClass = '') {
   span.className = 'system-text';
   span.textContent = String(text ?? '');
   div.appendChild(span);
-  area.appendChild(div);
-  area.scrollTop = area.scrollHeight;
+  appendTimelineEntry(area, div);
 }
 
 // Toast 通知：右上角浮层提示。level: 'error' | 'warn' | 'info'。
@@ -1884,12 +2146,15 @@ function showToast(title, body, level = 'info', duration = 6000) {
 // LLM 熔断告警：后端因欠费/额度受限或预算耗尽停止调用 AI 时，弹长驻 Toast 让玩家知情。
 function onLlmAlert(data) {
   // 回放期间不弹历史熔断告警：那是旧局记录，此刻已无参考意义，弹出反而误导玩家。
-  if (replaying) return;
+  if (replaying && !activeTimelineRestoring) return;
   const kind = data?.kind || 'billing';
   let title, body;
   if (kind === 'budget') {
     title = '⚠️ AI 调用已达预算上限';
     body = '已达到设定的 token/次数预算，AI 已自动停止以防超支。可在 .env 调高 LLM_TOKEN_BUDGET/LLM_CALL_BUDGET 后重启服务。';
+  } else if (kind === 'authentication') {
+    title = '⚠️ 模型认证失败';
+    body = '模型服务拒绝了本局的认证请求，AI 已停止调用。请检查服务端配置的 API Key 和模型权限。';
   } else {
     title = '⚠️ AI 暂时无法响应';
     body = 'API 余额不足或调用受限（欠费/额度耗尽），AI 已停止调用以防继续扣费。请检查账户后重启服务。';
@@ -1901,6 +2166,7 @@ function onLlmAlert(data) {
 }
 
 function addSpeechMessage(data, logText = '', sequence) {
+  const timestamp = timelineTimestamp;
   const showMessage = () => {
     const area = document.getElementById('dialogueArea');
     const div = document.createElement('div');
@@ -1909,16 +2175,16 @@ function addSpeechMessage(data, logText = '', sequence) {
     header.className = 'message-header';
     const name = document.createElement('span');
     name.className = 'message-name';
-    name.textContent = String(data.playerName ?? '');
+    name.textContent = String(data.displayName ?? data.playerName ?? '');
     const badge = document.createElement('span');
-    const isHuman = humanCharacterName && data.playerName === humanCharacterName;
+    const isHuman = mySeatId && data.playerId === mySeatId;
     badge.className = isHuman ? 'msg-you-badge' : 'msg-ai-badge';
-    badge.textContent = isHuman ? '你' : '🤖 AI';
+    badge.textContent = isHuman ? '你' : 'AI';
     if (!isHuman) badge.title = '该角色为人工智能，并非真人玩家';
     const title = document.createElement('span');
     title.className = 'message-title';
     title.textContent = String(data.title ?? '');
-    header.append(name, badge, title);
+    header.append(createCharacterAvatar(data.playerName), name, badge, title);
     div.appendChild(header);
     const thoughts = String(data.innerThoughts || '').trim();
     if (thoughts) {
@@ -1931,9 +2197,8 @@ function addSpeechMessage(data, logText = '', sequence) {
     speech.className = 'message-bubble';
     speech.textContent = String(data.publicSpeech ?? '');
     div.appendChild(speech);
-    area.appendChild(div);
-    area.scrollTop = area.scrollHeight;
-    if (logText) addLog(logText, 'speech');
+    appendTimelineEntry(area, div, sequence);
+    if (logText) addLog(logText, 'speech', sequence, timestamp);
   };
 
   const publicSpeech = String(data.publicSpeech ?? '');
@@ -1957,7 +2222,6 @@ function addVoteMessage(data) {
   if (!container || container.dataset.complete === 'true') {
     container = document.createElement('div');
     container.className = 'vote-container';
-    area.appendChild(container);
   }
 
   const item = document.createElement('div');
@@ -1967,8 +2231,7 @@ function addVoteMessage(data) {
     <span class="arrow">→</span>
     <span class="target">${data.targetName}</span>
   `;
-  container.appendChild(item);
-  area.scrollTop = area.scrollHeight;
+  appendTimelineEntry(area, item, scrollSequence, container);
 }
 
 function addVoteResultDisplay(tally) {
@@ -1999,12 +2262,11 @@ function addVoteResultDisplay(tally) {
         </div>
       </div>`;
   }
-  container.appendChild(barContainer);
-  area.scrollTop = area.scrollHeight;
+  appendTimelineEntry(area, barContainer, scrollSequence, container);
 }
 
 function showPhaseTransition(text, phaseClass) {
-  if (activeTimelineRestoring) return;
+  if (replaying) return;
   const overlay = document.createElement('div');
   overlay.className = `phase-transition ${phaseClass}`;
   overlay.innerHTML = `<span class="phase-transition-text">${text}</span>`;
@@ -2012,14 +2274,14 @@ function showPhaseTransition(text, phaseClass) {
   setTimeout(() => overlay.remove(), 1800);
 }
 
-function addLog(text, type = '') {
+function addLog(text, type = '', sequence = scrollSequence, timestamp = timelineTimestamp) {
   const log = document.getElementById('eventLog');
   const entry = document.createElement('div');
   entry.className = `log-entry log-${type}`;
-  const time = new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+  const date = Number.isFinite(timestamp) ? new Date(timestamp) : new Date();
+  const time = date.toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
   entry.textContent = `[${time}] ${text}`;
-  log.appendChild(entry);
-  log.scrollTop = log.scrollHeight;
+  appendTimelineEntry(log, entry, sequence);
 }
 
 // 各决策环节的中文名，用于把后端的 operation 字段翻成玩家能懂的说法。
@@ -2144,28 +2406,8 @@ function showRestartButton() {
 
   const btn = document.createElement('button');
   btn.id = 'restartFloatBtn';
-  btn.textContent = '🔄 再来一局';
-  btn.style.cssText = `
-    padding: 6px 14px;
-    font-size: 13px;
-    font-weight: bold;
-    color: #fff;
-    background: linear-gradient(135deg, #e74c3c, #c0392b);
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    box-shadow: 0 2px 8px rgba(231,76,60,0.4);
-    transition: transform 0.2s, box-shadow 0.2s;
-    margin-left: 10px;
-  `;
-  btn.onmouseenter = () => {
-    btn.style.transform = 'scale(1.05)';
-    btn.style.boxShadow = '0 4px 12px rgba(231,76,60,0.6)';
-  };
-  btn.onmouseleave = () => {
-    btn.style.transform = 'scale(1)';
-    btn.style.boxShadow = '0 2px 8px rgba(231,76,60,0.4)';
-  };
+  btn.textContent = '再来一局';
+  btn.className = 'btn-ctrl btn-restart';
   btn.onclick = () => {
     resetToWelcome();
   };
@@ -2205,5 +2447,6 @@ function acceptCompliance() {
 }
 
 // ====== 初始化 ======
+renderLobbyRoster();
 showComplianceModalIfNeeded();
 connectWebSocket();

@@ -381,6 +381,9 @@ export class WebServer {
   }
 
   private handleGameEvent(source: GameUIEvent): void {
+    if (source.type === 'game_start') {
+      source = { ...source, data: { ...source.data, model: this.gameController.getState().model } };
+    }
     const publicReplay = projectEventForPublicReplay(source);
     if (publicReplay) this.eventLog.record(publicReplay);
     for (const context of this.clients) {
@@ -632,13 +635,13 @@ export class WebServer {
   }
 
   /** 启动服务并返回实际端口；port=0 可用于集成测试。 */
-  start(port = this.port): Promise<number> {
+  start(port = this.port, host?: string): Promise<number> {
     if (this.server.listening) return Promise.resolve((this.server.address() as AddressInfo).port);
     this.port = port;
     return new Promise((resolve, reject) => {
       const onError = (error: Error) => reject(error);
       this.server.once('error', onError);
-      this.server.listen(port, () => {
+      this.server.listen(port, host, () => {
         this.server.off('error', onError);
         const actualPort = (this.server.address() as AddressInfo).port;
         console.log(`[WebServer] 服务已启动: http://localhost:${actualPort}`);
