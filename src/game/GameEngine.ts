@@ -142,7 +142,7 @@ export class GameEngine {
     this.eventBus = options.eventBus ?? globalEventBus;
     this.presentationAckEnabled = options.presentationAckEnabled ?? false;
     this.onPhaseBoundary = options.onPhaseBoundary;
-    if (options.retryModel) this.llm = this.wrapModel(llm, options.retryModel);
+    if (options.retryModel || this.presentationAckEnabled) this.llm = this.wrapModel(llm, options.retryModel);
     this.sheriffTransferRandom = this.random.fork('sheriff-transfer');
     this.gameId = (options.idFactory ?? randomUUID)();
   }
@@ -151,22 +151,26 @@ export class GameEngine {
   get cancelled(): boolean { return this._cancelled; }
   get modelFailure(): LLMErrorKind | null { return this._modelFailure; }
 
-  private wrapModel(initial: LLMProvider, reconnect: () => LLMProvider): LLMProvider {
+  private wrapModel(initial: LLMProvider, reconnect?: () => LLMProvider): LLMProvider {
     let provider = initial;
     const run = async <T>(call: (current: LLMProvider) => Promise<T>): Promise<T> => {
       let retry = false;
       for (;;) {
         await this.checkpoint();
+        let result: T;
         try {
-          if (retry) provider = reconnect();
-          return await call(provider);
+          if (retry && reconnect) provider = reconnect();
+          result = await call(provider);
         } catch (error: unknown) {
-          if (this._cancelled) throw error;
+          if (this._cancelled || !reconnect) throw error;
           this._modelFailure = error instanceof LLMError ? error.kind : 'unknown';
           if (this._paused) this.eventBus.emit('game_paused', { modelFailure: this._modelFailure });
           else this.pause();
           retry = true;
+          continue;
         }
+        await this.checkpoint();
+        return result;
       }
     };
     return {
@@ -227,14 +231,17 @@ export class GameEngine {
   /**
    * 暂停游戏
    */
-  pause(): void {
+  pause(reason?: 'host_away'): void {
     if (!this._paused) {
       this._paused = true;
       this._pausePromise = new Promise(resolve => {
         this._pauseResolve = resolve;
       });
       console.log('[Engine] 游戏已暂停');
-      this.eventBus.emit('game_paused', this._modelFailure ? { modelFailure: this._modelFailure } : {});
+      this.eventBus.emit('game_paused', {
+        ...(this._modelFailure ? { modelFailure: this._modelFailure } : {}),
+        ...(reason ? { reason } : {}),
+      });
     }
   }
 
@@ -306,6 +313,7 @@ export class GameEngine {
   async waitForSpeechPresentation(sequence: number, text: string): Promise<void> {
     if (!this.presentationAckEnabled || !this.presentationClientAvailable) {
       await this.delay(estimateSpeechBaseMs(text));
+      await this.checkpoint();
       return;
     }
     if (this.pendingPresentation) throw new Error('PRESENTATION_ALREADY_PENDING');
@@ -375,12 +383,12 @@ export class GameEngine {
   }
 
   /** 先登记 pending 再发布事件，避免同步监听方错过请求。 */
-  waitForHumanInput(playerId: string, prompt: string, options: any): Promise<any> {
-    if (this.pendingHumanInput) return Promise.reject(new Error('HUMAN_INPUT_ALREADY_PENDING'));
+  async waitForHumanInput(playerId: string, prompt: string, options: any): Promise<any> {
+    if (this.pendingHumanInput) throw new Error('HUMAN_INPUT_ALREADY_PENDING');
     const requestId = randomUUID();
     const normalizedOptions = JSON.parse(JSON.stringify(options ?? {})) as Record<string, unknown>;
     const validate = inputValidator(normalizedOptions);
-    return new Promise((resolve, reject) => {
+    const input = await new Promise((resolve, reject) => {
       this.pendingHumanInput = {
         requestId,
         gameId: this.gameId,
@@ -393,6 +401,8 @@ export class GameEngine {
       };
       this.eventBus.emit('human_input_required', { requestId, playerId, prompt, options: { ...this.pendingHumanInput.options } });
     });
+    await this.checkpoint();
+    return input;
   }
 
   /**

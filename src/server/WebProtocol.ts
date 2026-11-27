@@ -8,6 +8,7 @@ export type ClientCommand =
   | { type: 'authenticate'; token: string; checkpoint?: string; deferCheckpoint?: boolean }
   | { type: 'create_room' | 'close_room' }
   | { type: 'ping' }
+  | { type: 'page_visibility'; visible: boolean }
   | { type: 'start_game'; config?: Record<string, unknown> }
   | { type: 'pause_game' | 'resume_game' | 'cancel_game' }
   | { type: 'restart_game'; config?: Record<string, unknown> }
@@ -88,6 +89,9 @@ export function decodeClientCommand(value: unknown): ClientCommand | null {
       return exactKeys(value, ['type'], ['type']) ? { type: value.type } : null;
     case 'ping':
       return exactKeys(value, ['type'], ['type']) ? { type: 'ping' } : null;
+    case 'page_visibility':
+      return exactKeys(value, ['type', 'visible'], ['type', 'visible']) && typeof value.visible === 'boolean'
+        ? { type: 'page_visibility', visible: value.visible } : null;
     case 'pause_game': case 'resume_game': case 'cancel_game':
       return exactKeys(value, ['type'], ['type']) ? { type: value.type } : null;
     case 'start_game': case 'restart_game': {

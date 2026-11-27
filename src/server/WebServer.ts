@@ -25,6 +25,8 @@ interface ConnectionContext {
   session: SessionRecord | null;
   authTimer: NodeJS.Timeout | null;
   isPresentationClient: boolean;
+  pageVisible: boolean;
+  awaitingPong: boolean;
 }
 
 export interface WebServerOptions {
@@ -36,6 +38,8 @@ export interface WebServerOptions {
   ttsService?: TTSService;
   eventBus?: GameEventBus;
   hostDisconnectGraceMs?: number;
+  hostPauseGraceMs?: number;
+  heartbeatIntervalMs?: number;
   controlCooldownMs?: number;
   minorControlCooldownMs?: number;
   checkpointKey?: string;
@@ -59,11 +63,14 @@ export class WebServer {
   private readonly checkpointCodec?: GameCheckpointCodec;
   private readonly authTimeoutMs: number;
   private readonly hostDisconnectGraceMs: number;
+  private readonly hostPauseGraceMs: number;
+  private readonly heartbeatTimer: NodeJS.Timeout;
   private readonly controlCooldownMs: number;
   private readonly minorControlCooldownMs: number;
   private readonly controlTimestamps = new Map<string, Map<string, number>>();
   private unsubscribeEventBus: (() => void) | null = null;
   private hostReleaseTimer: NodeJS.Timeout | null = null;
+  private hostPauseTimer: NodeJS.Timeout | null = null;
   private pendingHostReleaseSession: SessionRecord | null = null;
   private presentationConnectionId: string | null = null;
   private presentationToken: string | null = null;
@@ -86,11 +93,13 @@ export class WebServer {
     this.ttsService = options.ttsService ?? getTTSService();
     this.authTimeoutMs = options.authTimeoutMs ?? 5_000;
     this.hostDisconnectGraceMs = options.hostDisconnectGraceMs ?? this.readNonNegativeInt('HOST_DISCONNECT_GRACE_MS', 90_000);
+    this.hostPauseGraceMs = options.hostPauseGraceMs ?? 750;
     this.controlCooldownMs = options.controlCooldownMs ?? this.readNonNegativeInt('CONTROL_COOLDOWN_MS', 10_000);
     this.minorControlCooldownMs = options.minorControlCooldownMs ?? this.readNonNegativeInt('MINOR_CONTROL_COOLDOWN_MS', 1_000);
     this.setupExpress();
     this.setupWebSocket();
     this.unsubscribeEventBus = this.eventBus.onAll(event => this.handleGameEvent(event));
+    this.heartbeatTimer = setInterval(() => this.checkConnections(), options.heartbeatIntervalMs ?? 10_000).unref();
   }
 
   private setupExpress(): void {
@@ -233,8 +242,11 @@ export class WebServer {
         session: null,
         authTimer: null,
         isPresentationClient: false,
+        pageVisible: true,
+        awaitingPong: false,
       };
       this.clients.add(context);
+      ws.on('pong', () => { context.awaitingPong = false; });
       context.authTimer = setTimeout(() => {
         if (!context.session) ws.close(4001, 'authentication required');
       }, this.authTimeoutMs);
@@ -259,11 +271,29 @@ export class WebServer {
     });
   }
 
+  private checkConnections(): void {
+    for (const context of this.clients) {
+      if (context.ws.readyState !== WebSocket.OPEN) continue;
+      if (context.awaitingPong) context.ws.terminate();
+      else {
+        context.awaitingPong = true;
+        context.ws.ping();
+      }
+    }
+  }
+
   private handleClientMessage(context: ConnectionContext, command: ClientCommand): void {
     if (command.type === 'ping') { this.send(context, transportEvent('pong', {})); return; }
     if (command.type === 'authenticate') { this.authenticate(context, command.token, command.checkpoint, command.deferCheckpoint); return; }
     if (!context.session) { this.sendError(context, 'authentication_required'); return; }
     const session = context.session;
+    if (command.type === 'page_visibility') {
+      if (context.pageVisible !== command.visible) {
+        context.pageVisible = command.visible;
+        if (session.isHost) this.reconcilePresentationClient();
+      }
+      return;
+    }
     if (command.type === 'create_room') {
       const result = this.sessions.createRoom(session);
       if (result === 'created' || result === 'already_creator') {
@@ -350,6 +380,7 @@ export class WebServer {
       sessionId: session.sessionId,
       isHost: session.isHost,
       isPresentationClient: context.isPresentationClient,
+      supportsPageVisibility: true,
       presentationToken: context.isPresentationClient ? this.presentationToken : null,
       seatId: session.seatId,
       room: this.roomStateFor(session),
@@ -450,6 +481,8 @@ export class WebServer {
 
   private handleGameEvent(source: GameUIEvent): void {
     if (source.type === 'game_start') {
+      this.cancelHostPause();
+      this.syncHostPause();
       source = { ...source, data: { ...source.data, model: this.gameController.getState().model } };
     }
     const publicReplay = projectEventForPublicReplay(source);
@@ -460,9 +493,11 @@ export class WebServer {
       if (projected) this.send(context, projected);
     }
     if (source.type === 'game_end' || source.type === 'game_cancelled') {
+      this.cancelHostPause();
       this.sessions.clearGame(source.data.gameId);
       setTimeout(() => this.maybeScheduleDisconnectedHostRelease(), 0);
     }
+    if (source.type === 'game_resumed') this.syncHostPause();
   }
 
   private viewerFor(session: SessionRecord): ViewerContext {
@@ -579,10 +614,32 @@ export class WebServer {
       }
     }
     this.gameController.setPresentationClientAvailable(!!selected);
+    this.syncHostPause();
   }
 
   private isEligiblePresentationClient(context: ConnectionContext): boolean {
-    return !!context.session?.isHost && context.ws.readyState === WebSocket.OPEN;
+    return !!context.session?.isHost && context.pageVisible && context.ws.readyState === WebSocket.OPEN;
+  }
+
+  private syncHostPause(): void {
+    const { gameId, isRunning, paused } = this.gameController.getState();
+    if (!this.unsubscribeEventBus || !isRunning || paused || !gameId || this.presentationConnectionId) {
+      this.cancelHostPause();
+      return;
+    }
+    if (this.hostPauseTimer) return;
+    this.hostPauseTimer = setTimeout(() => {
+      this.hostPauseTimer = null;
+      const state = this.gameController.getState();
+      if (state.isRunning && !state.paused && state.gameId === gameId && !this.presentationConnectionId) {
+        this.gameController.pauseGame('host_away');
+      }
+    }, this.hostPauseGraceMs);
+  }
+
+  private cancelHostPause(): void {
+    if (this.hostPauseTimer) clearTimeout(this.hostPauseTimer);
+    this.hostPauseTimer = null;
   }
 
   private hasOpenConnection(session: SessionRecord): boolean {
@@ -723,6 +780,8 @@ export class WebServer {
     this.unsubscribeEventBus?.();
     this.unsubscribeEventBus = null;
     this.cancelHostRelease();
+    this.cancelHostPause();
+    clearInterval(this.heartbeatTimer);
     for (const context of this.clients) {
       if (context.authTimer) clearTimeout(context.authTimer);
       context.ws.terminate();

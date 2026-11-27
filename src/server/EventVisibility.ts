@@ -134,8 +134,10 @@ export function projectEventForViewer(input: GameUIEvent, viewer: ViewerContext)
         ...(typeof d.model === 'string' ? { model: d.model } : {}),
       });
     }
-    case 'game_paused': return event(source, source.type, source.data.modelFailure
-      ? { modelFailure: source.data.modelFailure } : {});
+    case 'game_paused': return event(source, source.type, {
+      ...(source.data.modelFailure ? { modelFailure: source.data.modelFailure } : {}),
+      ...(source.data.reason === 'host_away' ? { reason: source.data.reason } : {}),
+    });
     case 'game_resumed': return event(source, source.type, {});
     case 'game_cancelled': return event(source, source.type, {});
     case 'phase_change': { const d = source.data; return event(source, source.type, { phase: d.phase, round: d.round }); }
