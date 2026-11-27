@@ -1,6 +1,6 @@
 {
   "name": "sanguo-werewolf",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "三国狼人杀 - 多智能体游戏框架",
   "main": "dist/index.js",
   "scripts": {

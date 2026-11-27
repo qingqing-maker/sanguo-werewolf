@@ -39,6 +39,7 @@ if (!/^[A-Za-z0-9_-]{43}$/.test(sessionToken || '')) {
   localStorage.setItem('sanguo-session-token', sessionToken);
 }
 let authenticated = false;
+let supportsPageVisibility = false;
 let isHost = false;
 // 同一主持人可开多个标签页，但只有服务端授予租约的一个连接负责 TTS 和播放完成回执。
 let isPresentationClient = false;
@@ -227,7 +228,7 @@ function notifyTtsQuotaExhausted() {
 }
 
 function sendSpeechPresented(sequence) {
-  if (!isHost || !isPresentationClient || !authenticated || replaying || !currentGameId) return;
+  if (!isHost || !isPresentationClient || !authenticated || document.hidden || replaying || !currentGameId) return;
   if (!Number.isSafeInteger(sequence) || sequence <= 0) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({
@@ -288,7 +289,7 @@ function speakText(text, playerName, showMessage, sequence) {
     presented: false,
   };
   // 非展示端只恢复文字。服务端只接受唯一展示端的回执，因此其他标签页绝不能合成或播放。
-  if (!isPresentationClient) {
+  if (!isPresentationClient || document.hidden) {
     showTtsItem(item);
     return;
   }
@@ -554,12 +555,31 @@ function connectWebSocket() {
   };
 }
 
-window.addEventListener('beforeunload', () => {
-  reconnectStopped = true;
-  connectionGeneration++;
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+function reportPageVisibility(visible) {
+  if (!authenticated || !supportsPageVisibility || ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'page_visibility', visible }));
+}
+
+document.addEventListener('visibilitychange', () => {
+  reportPageVisibility(!document.hidden);
+  if (document.hidden && isPresentationClient) stopPendingTts(true, false);
+  if (!document.hidden && !reconnectStopped && ws?.readyState === WebSocket.CLOSED) connectWebSocket();
 });
-window.addEventListener('pagehide', saveScrollView);
+
+window.addEventListener('pagehide', () => {
+  saveScrollView();
+  reportPageVisibility(false);
+  reconnectStopped = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (isPresentationClient) stopPendingTts(true, false);
+  ws?.close();
+});
+window.addEventListener('pageshow', event => {
+  if (!event.persisted) return;
+  reconnectStopped = false;
+  isReconnect = true;
+  connectWebSocket();
+});
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 
 // ====== 事件处理 ======
@@ -633,6 +653,8 @@ function processEvent(msg) {
         scrollViewReady = false;
       }
       authenticated = true;
+      supportsPageVisibility = !!msg.data.supportsPageVisibility;
+      if (document.hidden) reportPageVisibility(false);
       void refreshBackendTtsStatus();
       isHost = !!msg.data.isHost;
       isPresentationClient = !!msg.data.isPresentationClient;
@@ -817,8 +839,8 @@ function processEvent(msg) {
       modelFailure = msg.data.modelFailure || null;
       pauseTtsPlayback();
       updateControlButtons();
-      addLog(modelFailure ? '模型请求失败，对局暂停' : '游戏已暂停', 'system');
-      addSystemMessage(modelFailure ? '模型请求失败，对局暂停' : '⏸ 游戏已暂停');
+      addLog(pauseStatusText(msg.data), 'system');
+      addSystemMessage(`⏸ ${pauseStatusText(msg.data)}`);
       break;
     case 'game_resumed':
       gamePaused = false;
@@ -1796,13 +1818,19 @@ function renderActiveTimelineEvent(event) {
     case 'provider_fallback': onProviderFallback(event.data); break;
     case 'llm_alert': onLlmAlert(event.data); break;
     case 'game_paused':
-      addLog('游戏已暂停', 'system');
-      addSystemMessage('⏸ 游戏已暂停');
+      addLog(pauseStatusText(event.data), 'system');
+      addSystemMessage(`⏸ ${pauseStatusText(event.data)}`);
       break;
     case 'game_resumed':
       addLog('游戏已继续', 'system');
       break;
   }
+}
+
+function pauseStatusText(data) {
+  if (data.modelFailure) return '模型请求失败，对局暂停';
+  if (data.reason === 'host_away') return '主持人已离开，对局自动暂停';
+  return '游戏已暂停';
 }
 
 function restorePrivateSnapshot(snapshot) {

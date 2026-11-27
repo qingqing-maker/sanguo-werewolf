@@ -104,9 +104,9 @@ export class GameController {
     return run;
   }
 
-  pauseGame(): void {
+  pauseGame(reason?: 'host_away'): void {
     if (this.engine && this.isRunning && this.currentGameId) {
-      this.eventBus.runWithGameId(this.currentGameId, () => this.engine!.pause());
+      this.eventBus.runWithGameId(this.currentGameId, () => this.engine!.pause(reason));
     }
   }
   resumeGame(): void {

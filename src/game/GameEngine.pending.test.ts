@@ -154,6 +154,38 @@ async function main(): Promise<void> {
   assert.equal(dawns, 1);
   assert.equal(retryDegrades, 0);
 
+  const awayBus = new EventBus();
+  const blockModel = deferred<void>();
+  const modelStarted = deferred<void>();
+  const modelReturned = deferred<void>();
+  const nightAction = deferred<void>();
+  const heldModel = new MockProvider();
+  const heldChatJSON = heldModel.chatJSON.bind(heldModel);
+  heldModel.chatJSON = async <T>(...args: Parameters<LLMProvider['chatJSON']>) => {
+    modelStarted.resolve();
+    await blockModel.promise;
+    const result = await heldChatJSON<T>(...args);
+    modelReturned.resolve();
+    return result;
+  };
+  let appliedActions = 0;
+  awayBus.on('night_action_done', () => { appliedActions++; nightAction.resolve(); });
+  const awayEngine = new GameEngine(RoleRegistry.getDefaultConfig(), heldModel, {
+    eventBus: awayBus, presentationAckEnabled: true,
+  });
+  const awayRun = awayEngine.start();
+  await modelStarted.promise;
+  awayEngine.pause('host_away');
+  blockModel.resolve();
+  await modelReturned.promise;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(appliedActions, 0, '暂停期间不应用已经发出的模型请求的结果');
+  awayEngine.resume();
+  await nightAction.promise;
+  awayEngine.cancel();
+  await awayRun;
+  assert.equal(appliedActions, 1);
+
   const cancelledPresentation = presentationEngine.waitForSpeechPresentation(10, '取消中的发言');
   presentationEngine.cancel();
   await assert.rejects(cancelledPresentation, /GAME_CANCELLED/);

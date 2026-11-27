@@ -10,6 +10,7 @@ async function main(): Promise<void> {
   assert.deepEqual(decodeClientCommand({ type: 'create_room' }), { type: 'create_room' });
   assert.deepEqual(decodeClientCommand({ type: 'close_room' }), { type: 'close_room' });
   assert.deepEqual(decodeClientCommand({ type: 'ping' }), { type: 'ping' });
+  assert.deepEqual(decodeClientCommand({ type: 'page_visibility', visible: false }), { type: 'page_visibility', visible: false });
   assert.deepEqual(decodeClientCommand({ type: 'pause_game' }), { type: 'pause_game' });
   assert.deepEqual(decodeClientCommand({ type: 'speech_presented', data: { gameId: 'game_1', sequence: 7 } }), {
     type: 'speech_presented', data: { gameId: 'game_1', sequence: 7 },
@@ -25,6 +26,7 @@ async function main(): Promise<void> {
     null, [], { type: 'authenticate', token: 'short' }, { type: 'ping', extra: true },
     { type: 'authenticate', token, checkpoint: 'not-a-checkpoint' },
     { type: 'authenticate', token, deferCheckpoint: true },
+    { type: 'page_visibility', visible: 'false' }, { type: 'page_visibility', visible: false, host: true },
     { type: 'create_room', extra: true }, { type: 'close_room', extra: true },
     { type: 'join_game', playerId: 'player_1' }, { type: 'start_game', config: { operator: true } },
     { type: 'human_input', data: { gameId: '../bad', requestId: 'r', input: {} } },

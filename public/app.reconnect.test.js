@@ -74,9 +74,11 @@ class FakeElement {
 class FakeDocument {
   constructor() {
     this.elements = new Map();
+    this.listeners = new Map();
     this.body = this.make('body', 'body');
     this.body.classList = new FakeClassList();
   }
+  addEventListener(type, callback) { this.listeners.set(type, callback); }
   make(tag, id) {
     const element = new FakeElement(tag, this);
     element.id = id;
@@ -120,6 +122,7 @@ function makeHarness(savedScroll = new Map()) {
 
   class FakeWebSocket {
     static OPEN = 1;
+    static CLOSED = 3;
     static instances = [];
     constructor(url) {
       this.url = url;
@@ -129,7 +132,7 @@ function makeHarness(savedScroll = new Map()) {
     }
     send(value) { this.sent.push(JSON.parse(value)); }
     open() { this.onopen?.(); }
-    close(code = 1006) { this.onclose?.({ code }); }
+    close(code = 1006) { this.readyState = FakeWebSocket.CLOSED; this.onclose?.({ code }); }
     message(value) { this.onmessage?.({ data: JSON.stringify(value) }); }
   }
 
@@ -527,6 +530,27 @@ async function main() {
     assert.equal(h.evaluate('clueMarks.p2'), 'suspect');
     h.evaluate('resetClueBoard("g2")');
     assert.equal(h.evaluate('clueMarks.p2'), undefined);
+  });
+
+  await check('后台和页面离开会通知服务端，前台和缓存返回不会自动继续', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated({ isHost: true, supportsPageVisibility: true, state: state('g1', true) }));
+    h.document.hidden = true;
+    h.document.listeners.get('visibilitychange')();
+    assert.deepEqual(socket.sent.at(-1), { type: 'page_visibility', visible: false });
+    socket.message({ type: 'game_paused', data: { gameId: 'g1', reason: 'host_away' }, sequence: 1 });
+    assert.ok(logs(h).some(line => line.includes('主持人已离开')));
+    h.document.hidden = false;
+    h.document.listeners.get('visibilitychange')();
+    assert.deepEqual(socket.sent.at(-1), { type: 'page_visibility', visible: true });
+    assert.equal(h.evaluate('gamePaused'), true);
+    h.windowListeners.get('pagehide')();
+    assert.deepEqual(socket.sent.at(-1), { type: 'page_visibility', visible: false });
+    h.windowListeners.get('pageshow')({ persisted: true });
+    assert.equal(h.sockets.length, 2);
+    assert.ok(!h.sockets.flatMap(s => s.sent).some(event => event.type === 'resume_game'));
   });
 
   await check('模型故障重连仍显示重试，恢复后清除故障提示', () => {

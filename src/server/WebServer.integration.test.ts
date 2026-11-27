@@ -16,8 +16,9 @@ function onceMessage(ws: WebSocket): Promise<any> {
     ws.once('message', raw => { clearTimeout(timeout); resolve(JSON.parse(raw.toString())); });
   });
 }
-async function connect(port: number, value: string): Promise<{ ws: WebSocket; auth: any }> {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+async function connect(port: number, value: string, autoPong = true): Promise<{ ws: WebSocket; auth: any }> {
+  const options = { handshakeTimeout: 2_000, autoPong };
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`, options);
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   ws.send(JSON.stringify({ type: 'authenticate', token: value }));
   return { ws, auth: await onceMessage(ws) };
@@ -86,6 +87,7 @@ class FakeController {
   state: any = { isRunning: false, paused: false, provider: 'mock', model: 'mock', gameId: null, phase: null, round: 0, players: [], aiDifficulty: 'standard', humanCharacterName: null };
   pending: any = null;
   busy = false;
+  pauseReasons: Array<string | undefined> = [];
   presentationAvailable = false;
   presented: Array<{ gameId: string; sequence: number }> = [];
   startGame(config: any, initialized?: (gameId: string, players: any[]) => void): Promise<void> {
@@ -121,7 +123,7 @@ class FakeController {
     return true;
   }
   getPendingPresentationSequence(): number | null { return null; }
-  pauseGame(): void { this.state.paused = true; }
+  pauseGame(reason?: string): void { this.state.paused = true; this.pauseReasons.push(reason); }
   resumeGame(): void { this.state.paused = false; }
   cancelGame(): void { this.state.isRunning = false; }
 }
@@ -461,6 +463,58 @@ async function main(): Promise<void> {
   assert.equal(released.data.exists, false, '离线宽限期结束后空闲房间应自动释放');
   releaseGuest.ws.close();
   await releaseServer.stop();
+
+  const presenceController = new FakeController();
+  const presenceServer = new WebServer({
+    controller: presenceController as any, eventLog: new FakeEventLog() as any, ttsService,
+    hostPauseGraceMs: 20, heartbeatIntervalMs: 250, controlCooldownMs: 0, minorControlCooldownMs: 0,
+  });
+  const presencePort = await presenceServer.start(0);
+  const presenterToken = token();
+  const presenter = await connect(presencePort, presenterToken);
+  const otherTab = await connect(presencePort, presenterToken);
+  const observer = await connect(presencePort, token());
+  const command = async (socket: WebSocket, value: object) => {
+    const flushed = collectMessagesUntil(socket, 'pong');
+    socket.send(JSON.stringify(value));
+    socket.send(JSON.stringify({ type: 'ping' }));
+    await flushed;
+  };
+  const tick = () => new Promise(resolve => setTimeout(resolve, 60));
+  try {
+    await command(presenter.ws, { type: 'create_room' });
+    await command(presenter.ws, { type: 'start_game' });
+    await command(observer.ws, { type: 'page_visibility', visible: false });
+    await command(presenter.ws, { type: 'page_visibility', visible: false });
+    await tick();
+    assert.equal(presenceController.state.paused, false, '还有前台主持人时，观众或另一个标签页离开不暂停');
+    assert.equal(presenceController.presentationAvailable, true);
+    await command(otherTab.ws, { type: 'page_visibility', visible: false });
+    await tick();
+    assert.equal(presenceController.state.paused, true, '所有主持人进入后台，即使连接仍开着也要暂停');
+    assert.deepEqual(presenceController.pauseReasons, ['host_away']);
+    await command(presenter.ws, { type: 'page_visibility', visible: true });
+    assert.equal(presenceController.state.paused, true, '回到前台不会自动继续');
+    await command(presenter.ws, { type: 'resume_game' });
+    assert.equal(presenceController.state.paused, false);
+    const disconnected = new Promise(resolve => presenter.ws.once('close', resolve));
+    presenter.ws.close();
+    await disconnected;
+    await tick();
+    assert.equal(presenceController.state.paused, true, '最后一个前台主持人关闭连接时暂停');
+
+    const stale = await connect(presencePort, presenterToken, false);
+    const timedOut = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('心跳未清理失活连接')), 2_000);
+      stale.ws.once('close', () => { clearTimeout(timeout); resolve(); });
+    });
+    await command(stale.ws, { type: 'resume_game' });
+    await timedOut;
+    await tick();
+    assert.equal(presenceController.state.paused, true, '心跳识别手机突然掉线后暂停');
+  } finally {
+    await presenceServer.stop();
+  }
 
   console.log('WebServer WebSocket/HTTP 集成测试通过');
 }
