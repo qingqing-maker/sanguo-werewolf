@@ -23,6 +23,7 @@ let ignoredReplayGameId = null;
 // 所有业务事件必须在任何 UI/TTS/状态副作用前按 gameId+sequence 过闸。
 // transport 消息不参与；legacy 无 sequence 仍可播放，但无法保证去重。
 const eventSequenceGuard = EventSequence.createEventSequenceGuard();
+const GAME_CHECKPOINT_KEY = 'sanguo-game-checkpoint';
 // 参战模式：欲加入时选定的人物名（发给后端 start_game.humanCharacterName）；观战模式为 null。
 let humanCharacterName = null;
 // 人类自己座位的 id。参战模式下开局时从 game_start 里带 roleType 的那个座位识别出来；观战模式为 null。
@@ -492,12 +493,15 @@ function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${protocol}//${location.host}`);
   ws = socket;
+  let offeredCheckpoint = false;
 
   socket.onopen = () => {
     if (generation !== connectionGeneration || socket !== ws) return;
     reconnectDelayMs = 1000;
     authenticated = false;
-    socket.send(JSON.stringify({ type: 'authenticate', token: sessionToken }));
+    const checkpoint = readGameCheckpoint()?.value;
+    offeredCheckpoint = typeof checkpoint === 'string';
+    socket.send(JSON.stringify({ type: 'authenticate', token: sessionToken, ...(offeredCheckpoint ? { checkpoint } : {}) }));
     if (!hasLoggedDisconnect) {
       addLog('已连接到服务器', 'system');
     }
@@ -532,6 +536,11 @@ function connectWebSocket() {
     if (generation !== connectionGeneration || socket !== ws) return;
     try {
       const msg = JSON.parse(event.data);
+      if (!authenticated && offeredCheckpoint && msg.type === 'error' && msg.data?.reason === 'invalid_message') {
+        offeredCheckpoint = false;
+        socket.send(JSON.stringify({ type: 'authenticate', token: sessionToken }));
+        return;
+      }
       handleEvent(msg);
     } catch (e) {
       console.error('解析错误:', e);
@@ -626,6 +635,7 @@ function processEvent(msg) {
       if (state) {
         renderModelInfo(state.model);
         // 活动局 cursor 先推进到权威值；replay_start 会重置历史局 cursor，从头重建。
+        if (serverRunning) eventSequenceGuard.resetGame(state.gameId);
         eventSequenceGuard.seed(state.gameId, msg.data.stateSequence);
         if (returnToLobby) {
           returnToLobbyAfterCancel();
@@ -633,7 +643,9 @@ function processEvent(msg) {
           restoreRunningGame(state);
           restoreActiveTimeline(msg.data.publicTimeline, msg.data.pendingPresentationSequence, state);
           restorePrivateSnapshot(msg.data.privateSnapshot);
-          addSystemMessage('🔄 已连接服务器，以上为当前对局的完整公共时间线。');
+          addSystemMessage(msg.data.checkpointStatus === 'restored'
+            ? '📜 已恢复最近存档。点击「继续」接着玩。'
+            : '🔄 已连接服务器，以上为当前对局的完整公共时间线。');
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
         } else if (!hasReplay) {
@@ -642,6 +654,7 @@ function processEvent(msg) {
         // hasReplay=true 时不改写当前历史状态，等待紧随其后的 replay_start 接管。
       }
       if (msg.data.pendingInput && serverRunning) showHumanInputPanel(msg.data.pendingInput);
+      handleCheckpointStatus(msg.data.checkpointStatus);
       updateControlButtons();
       if (didReconnect) addLog('已重新连接到服务器', 'system');
       if (!hasReplay && !scrollViewReady) restoreScrollView(serverRunning ? state.gameId : null);
@@ -681,7 +694,14 @@ function processEvent(msg) {
       if (msg.data?.message) addLog(msg.data.message, 'system');
       break;
     case 'game_start':
+      if (!replaying && isHost) discardGameCheckpoint();
       onGameStart(msg.data);
+      break;
+    case 'game_checkpoint':
+      if (isHost && !replaying && msg.data.gameId === currentGameId) {
+        try { localStorage.setItem(GAME_CHECKPOINT_KEY, JSON.stringify(msg.data)); }
+        catch (_) { showToast('未能保存对局', '浏览器存储不可用或已满。', 'warn'); }
+      }
       break;
     case 'phase_change':
       onPhaseChange(msg.data);
@@ -776,6 +796,7 @@ function processEvent(msg) {
       onHunterShoot(msg.data);
       break;
     case 'game_end':
+      discardGameCheckpoint(eventGameId);
       clearPendingHumanInput();
       onGameEnd(msg.data);
       break;
@@ -793,6 +814,7 @@ function processEvent(msg) {
       addLog('游戏已继续', 'system');
       break;
     case 'game_cancelled':
+      discardGameCheckpoint(eventGameId);
       clearPendingHumanInput();
       stopPendingTts();
       if (gameCancelPending && !replaying) {
@@ -837,6 +859,26 @@ function processEvent(msg) {
       addLog(`错误: ${msg.data.message || msg.data.reason}`, 'system');
       break;
     }
+  }
+}
+
+function readGameCheckpoint() {
+  try { return JSON.parse(localStorage.getItem(GAME_CHECKPOINT_KEY)); }
+  catch (_) { return null; }
+}
+
+function discardGameCheckpoint(gameId) {
+  if (gameId && readGameCheckpoint()?.gameId !== gameId) return;
+  try { localStorage.removeItem(GAME_CHECKPOINT_KEY); }
+  catch (_) { /* 浏览器未允许写入。 */ }
+}
+
+function handleCheckpointStatus(status) {
+  if (status === 'invalid' || status === 'ended') {
+    discardGameCheckpoint();
+    if (status === 'invalid') showToast('这份存档无法打开', '存档损坏，或服务端已更换存档密钥。', 'warn');
+  } else if (status === 'unavailable' || status === 'disabled') {
+    showToast('暂时无法续局', '浏览器仍保留存档，请在服务就绪后刷新重试。', 'warn');
   }
 }
 

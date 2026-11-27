@@ -8,7 +8,7 @@
   // WebSocket 协议控制消息不属于 GameUIEvent，不占用也不检查业务 sequence。
   const TRANSPORT_TYPES = new Set([
     'authenticated', 'session_updated', 'room_state', 'room_create_result', 'connected', 'replay_start', 'replay_end',
-    'human_input_result', 'error', 'pong', 'settings', 'settings_updated',
+    'human_input_result', 'error', 'pong', 'settings', 'settings_updated', 'game_checkpoint',
   ]);
 
   function isValidSequence(value) {

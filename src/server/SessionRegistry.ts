@@ -4,6 +4,7 @@ export const SESSION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export interface SessionRecord {
   readonly sessionId: string;
+  readonly tokenHash: string;
   isHost: boolean;
   seatId: string | null;
   gameId: string | null;
@@ -46,6 +47,7 @@ export class SessionRegistry {
     if (this.sessionsByHash.size >= this.maxSessions) return null;
     const session: SessionRecord = {
       sessionId: randomUUID(),
+      tokenHash: hash,
       isHost: false,
       seatId: null,
       gameId: null,

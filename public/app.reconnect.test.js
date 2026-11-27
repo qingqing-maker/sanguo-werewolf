@@ -152,7 +152,11 @@ function makeHarness(savedScroll = new Map()) {
     document,
     history: { scrollRestoration: 'auto' },
     confirm: () => true,
-    localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    },
     sessionStorage: { getItem: (key) => savedScroll.get(key) ?? null, setItem: (key, value) => savedScroll.set(key, value) },
     crypto: { getRandomValues: (array) => array.fill(1) },
     btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
@@ -381,6 +385,24 @@ async function main() {
     socket.message({ ...replayStart, data: { ...replayStart.data, gameId: 'new' } });
     assert.equal(refreshed.document.body.classList.contains('lobby-view'), false);
     assert.equal(refreshed.evaluate('currentGameId'), 'new');
+  });
+
+  await check('主持人的最近存档随重连发送，终止对局时清除', () => {
+    const h = makeHarness();
+    const first = h.sockets[0];
+    first.open();
+    first.message(authenticated({ isHost: true, state: state('g1', true), stateSequence: 7 }));
+    first.message({ type: 'game_checkpoint', data: { gameId: 'g1', value: 'v1.saved' } });
+    first.close(1006);
+    h.runNextTimer();
+    const second = h.sockets[1];
+    second.open();
+    assert.equal(second.sent[0].checkpoint, 'v1.saved');
+    second.message(authenticated({ isHost: true, state: { ...state('g1', true), paused: true }, stateSequence: 4, checkpointStatus: 'restored' }));
+    assert.equal(h.evaluate('gamePaused'), true);
+    second.message({ type: 'game_cancelled', data: { gameId: 'g1' }, sequence: 5 });
+    assert.equal(h.context.localStorage.getItem('sanguo-game-checkpoint'), null);
+    assert.equal(h.evaluate('gameStarted'), false);
   });
 
   await check('直接打开大厅入口时，旧回放不接管页面', () => {

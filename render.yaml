@@ -31,6 +31,8 @@ services:
         value: responses
       - key: LLM_API_KEY
         sync: false
+      - key: GAME_SAVE_KEY
+        generateValue: true
       - key: LLM_TOKEN_BUDGET
         value: "450000"
       - key: LLM_CALL_BUDGET

@@ -1,5 +1,5 @@
 import { GameState, GamePhase, Faction, GameConfig, RoleType, EventType } from '../types';
-import { BaseAgent } from '../agents/BaseAgent';
+import { AgentCheckpoint, BaseAgent } from '../agents/BaseAgent';
 import { AgentFactory } from '../agents/AgentFactory';
 import { RoleRegistry } from '../roles/RoleRegistry';
 import { PhaseManager } from './PhaseManager';
@@ -83,6 +83,15 @@ export interface GameEngineOptions {
   eventBus?: EventPublisher;
   /** Web 模式由主持人浏览器在文字展示且 TTS 播放结束后回执；CLI/测试默认仍按字数估时。 */
   presentationAckEnabled?: boolean;
+  onPhaseBoundary?: (checkpoint: GameCheckpoint) => void;
+}
+
+export interface GameCheckpoint {
+  gameId: string;
+  config: GameConfig;
+  state: GameState;
+  agents: AgentCheckpoint[];
+  nextPhase: PhaseNode;
 }
 
 /**
@@ -95,6 +104,7 @@ export class GameEngine {
   private readonly sheriffTransferRandom: RandomSource;
   private readonly eventBus: EventPublisher;
   private readonly presentationAckEnabled: boolean;
+  private readonly onPhaseBoundary?: GameEngineOptions['onPhaseBoundary'];
   private presentationClientAvailable = false;
   private pendingPresentation: PendingPresentation | null = null;
 
@@ -129,6 +139,7 @@ export class GameEngine {
     this.random = options.random ?? new MathRandomSource();
     this.eventBus = options.eventBus ?? globalEventBus;
     this.presentationAckEnabled = options.presentationAckEnabled ?? false;
+    this.onPhaseBoundary = options.onPhaseBoundary;
     this.sheriffTransferRandom = this.random.fork('sheriff-transfer');
     this.gameId = (options.idFactory ?? randomUUID)();
   }
@@ -389,11 +400,11 @@ export class GameEngine {
   /**
    * 启动一局游戏
    */
-  async start(onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void): Promise<void> {
-    return this.eventBus.runWithGameId(this.gameId, () => this.startInContext(onInitialized));
+  async start(onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, checkpoint?: GameCheckpoint): Promise<void> {
+    return this.eventBus.runWithGameId(this.gameId, () => this.startInContext(onInitialized, checkpoint));
   }
 
-  private async startInContext(onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void): Promise<void> {
+  private async startInContext(onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, checkpoint?: GameCheckpoint): Promise<void> {
     this._paused = false;
     this._cancelled = false;
     if (this.abortController.signal.aborted) this.abortController = new AbortController();
@@ -405,10 +416,34 @@ export class GameEngine {
       throw new Error(`游戏配置无效: ${validation.error}`);
     }
 
-    this.initialize();
+    if (checkpoint) this.restoreCheckpoint(checkpoint);
+    else this.initialize();
     // 服务端在任何 game_start/私密事件投影前完成会话与座位绑定。
     onInitialized?.(this.gameId, this.getPlayers());
 
+    if (checkpoint) {
+      this._paused = true;
+      this._pausePromise = new Promise(resolve => { this._pauseResolve = resolve; });
+    } else {
+      this.publishGameStart();
+      this.printRoleAssignment();
+    }
+
+    try {
+      await this.gameLoop(checkpoint?.nextPhase);
+    } catch (e: any) {
+      // 本局 signal/_cancelled 是主动取消的权威；不能依赖底层异常恰好被
+      // BaseAgent 翻译成某个固定文案。
+      if (this._cancelled || this.abortController.signal.aborted || e?.message === 'GAME_CANCELLED') {
+        console.log('[Engine] 游戏被终止');
+        this.eventBus.emit('game_cancelled', {});
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  private publishGameStart(): void {
     // 人类若是狼，把队友名单附到它自己的座位上——notifyWolves 只写内存 agent 状态，
     // 前端读不到；而 game_start 的遮罩层会保留人类自己座位的字段，故走这里传递。
     const humanId = this.getHumanPlayerId();
@@ -433,21 +468,6 @@ export class GameEngine {
       })),
       config: this.config,
     });
-
-    this.printRoleAssignment();
-
-    try {
-      await this.gameLoop();
-    } catch (e: any) {
-      // 本局 signal/_cancelled 是主动取消的权威；不能依赖底层异常恰好被
-      // BaseAgent 翻译成某个固定文案。
-      if (this._cancelled || this.abortController.signal.aborted || e?.message === 'GAME_CANCELLED') {
-        console.log('[Engine] 游戏被终止');
-        this.eventBus.emit('game_cancelled', {});
-      } else {
-        throw e;
-      }
-    }
   }
 
   /**
@@ -486,8 +506,7 @@ export class GameEngine {
       agent.setPlayersRef(this.state.players);
     }
 
-    this.phaseManager = new PhaseManager(this.agents, this.state, this, this.random.fork('phases'), this.eventBus);
-    this.voteManager = new VoteManager(this.agents, this.state, this, this.eventBus);
+    this.initializeManagers();
 
     // 参战模式：把选定人物的座位标记为人类控制。人物由 AgentFactory 保证已在阵容内。
     if (this.config.humanCharacterName) {
@@ -496,6 +515,24 @@ export class GameEngine {
     }
 
     this.notifyWolves();
+  }
+
+  private initializeManagers(): void {
+    this.phaseManager = new PhaseManager(this.agents, this.state, this, this.random.fork('phases'), this.eventBus);
+    this.voteManager = new VoteManager(this.agents, this.state, this, this.eventBus);
+  }
+
+  private restoreCheckpoint(checkpoint: GameCheckpoint): void {
+    const saved = structuredClone(checkpoint);
+    this.state = saved.state;
+    const random = this.random.fork('agents');
+    this.agents = this.state.players.map((player, index) => {
+      const agent = new BaseAgent(player, this.llm, random.fork(`player/${player.id}`), this.eventBus, this.abortController.signal);
+      agent.restoreCheckpoint(saved.agents[index]);
+      agent.setPlayersRef(this.state.players);
+      return agent;
+    });
+    this.initializeManagers();
   }
 
   /**
@@ -531,9 +568,18 @@ export class GameEngine {
    * 用 handler 回传的信号问下一步去哪，直到进入 END。每个 handler 内部逻辑与 emit 与
    * 重构前完全一致，只是从一整段顺序代码拆成了可分派的方法。
    */
-  private async gameLoop(): Promise<void> {
-    let node = nextPhase(PhaseNode.START, {});
+  private async gameLoop(node = nextPhase(PhaseNode.START)): Promise<void> {
     while (node !== PhaseNode.END) {
+      if (this.onPhaseBoundary) {
+        await this.checkpoint();
+        this.onPhaseBoundary({
+          gameId: this.gameId,
+          config: this.config,
+          state: this.state,
+          agents: this.agents.map(agent => agent.createCheckpoint()),
+          nextPhase: node,
+        });
+      }
       const signal = await this.runPhase(node);
       node = nextPhase(node, signal);
     }

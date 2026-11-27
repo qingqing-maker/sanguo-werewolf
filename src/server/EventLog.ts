@@ -55,7 +55,24 @@ export class EventLog {
     }
   }
 
-  private rotate(gameId: string): void {
+  restore(gameId: string, events: readonly GameUIEvent[]): void {
+    this.rotate(gameId, 'w');
+    for (const event of events) {
+      if (event.data.gameId === gameId) this.record(event);
+    }
+  }
+
+  async close(): Promise<void> {
+    const stream = this.stream;
+    this.stream = null;
+    if (!stream || stream.closed) return;
+    await new Promise<void>(resolve => {
+      stream.once('close', resolve);
+      stream.end();
+    });
+  }
+
+  private rotate(gameId: string, flags = 'a'): void {
     if (this.stream) {
       try { this.stream.end(); } catch { /* 忽略关闭错误 */ }
       this.stream = null;
@@ -65,7 +82,7 @@ export class EventLog {
     this.buffer = [];
     const filePath = path.join(this.dir, `${this.sanitize(gameId)}.jsonl`);
     try {
-      const stream = fs.createWriteStream(filePath, { flags: 'a' });
+      const stream = fs.createWriteStream(filePath, { flags });
       stream.on('error', (e: Error) => {
         console.warn(`[EventLog] 日志流失败: ${this.errorMessage(e)}`);
         if (this.stream === stream) this.stream = null;

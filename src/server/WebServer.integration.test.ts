@@ -44,6 +44,7 @@ class FakeEventLog {
   latest: { gameId: string; events: GameUIEvent[] } | null = null;
   activeEvents: GameUIEvent[] = [];
   record(): void {}
+  async close(): Promise<void> {}
   loadEvents(gameId: string): GameUIEvent[] {
     return this.latest?.gameId === gameId ? [...this.latest.events] : [...this.activeEvents];
   }
