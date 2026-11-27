@@ -1,10 +1,11 @@
-import { GameEngine, HumanInputResult, PendingHumanInputSnapshot, SeatPrivateSnapshot } from '../game/GameEngine';
+import { GameCheckpoint, GameEngine, HumanInputResult, PendingHumanInputSnapshot, SeatPrivateSnapshot } from '../game/GameEngine';
 import { RoleRegistry } from '../roles/RoleRegistry';
 import { createLLMProvider, getConfiguredModelName, getConfiguredProviderName } from '../llm/ProviderFactory';
 import { GameConfig, Difficulty } from '../types';
 import { EventPublisher, globalEventBus } from '../game/EventBus';
 
 export type GameEngineFactory = (config: GameConfig) => GameEngine;
+type OnInitialized = Parameters<GameEngine['start']>[0];
 
 /** 游戏流程控制器；所有开局/重开操作均通过单一活动代次串行。 */
 export class GameController {
@@ -20,12 +21,28 @@ export class GameController {
   private readonly engineFactory: GameEngineFactory;
   private readonly eventBus: EventPublisher;
 
-  constructor(engineFactory?: GameEngineFactory, eventBus: EventPublisher = globalEventBus) {
+  constructor(
+    engineFactory?: GameEngineFactory,
+    eventBus: EventPublisher = globalEventBus,
+    private readonly onPhaseBoundary?: (checkpoint: GameCheckpoint) => void,
+  ) {
     this.eventBus = eventBus;
-    this.engineFactory = engineFactory ?? (config => {
-      const llm = createLLMProvider(undefined, false, { eventBus });
-      return new GameEngine(config, llm, { eventBus, presentationAckEnabled: true });
+    this.engineFactory = engineFactory ?? (config => this.createEngine(config));
+  }
+
+  private createEngine(config: GameConfig, gameId?: string): GameEngine {
+    const llm = createLLMProvider(undefined, false, { eventBus: this.eventBus });
+    return new GameEngine(config, llm, {
+      eventBus: this.eventBus,
+      presentationAckEnabled: true,
+      onPhaseBoundary: this.onPhaseBoundary,
+      idFactory: gameId ? () => gameId : undefined,
     });
+  }
+
+  restoreGame(checkpoint: GameCheckpoint, onInitialized?: OnInitialized): Promise<void> {
+    if (this.restartPending || this.activeRun || this.isRunning) throw new Error('GAME_BUSY');
+    return this.runEngine(this.createEngine(checkpoint.config, checkpoint.gameId), onInitialized, checkpoint);
   }
 
   /** 启动新局；已有启动、运行或重开操作时明确拒绝，不做隐式取消。 */
@@ -55,9 +72,12 @@ export class GameController {
   private beginGame(config?: Partial<GameConfig>, onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, restartReserved = false): Promise<void> {
     if ((!restartReserved && this.restartPending) || this.activeRun || this.isRunning) return Promise.reject(new Error('GAME_BUSY'));
     const gameConfig = config ? { ...RoleRegistry.getDefaultConfig(), ...config } : RoleRegistry.getDefaultConfig();
+    return this.runEngine(this.engineFactory(gameConfig), onInitialized);
+  }
+
+  private runEngine(engine: GameEngine, onInitialized?: OnInitialized, checkpoint?: GameCheckpoint): Promise<void> {
     const provider = getConfiguredProviderName();
     const model = getConfiguredModelName(provider);
-    const engine = this.engineFactory(gameConfig);
     const generation = ++this.generation;
     this.engine = engine;
     this.activeModel = { provider, model };
@@ -65,7 +85,7 @@ export class GameController {
     this.currentGameId = engine.getGameId();
     this.isRunning = true;
 
-    const run = engine.start(onInitialized).catch((error: unknown) => {
+    const run = engine.start(onInitialized, checkpoint).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       if (message !== 'GAME_CANCELLED') console.error('[GameController] 游戏错误:', message);
     }).finally(() => {

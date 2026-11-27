@@ -30,7 +30,9 @@ export interface EventSubscriber {
   onAll(handler: AnyEventHandler): () => void;
 }
 
-export type GameEventBus = EventPublisher & EventSubscriber;
+export type GameEventBus = EventPublisher & EventSubscriber & {
+  restoreGameSequence(gameId: string, sequence: number): void;
+};
 
 export class EventBus implements GameEventBus {
   private readonly gameContext = new AsyncLocalStorage<string>();
@@ -48,6 +50,10 @@ export class EventBus implements GameEventBus {
 
   getLatestSequence(gameId: string): number {
     return this.latestSequenceByGame.get(gameId) ?? 0;
+  }
+
+  restoreGameSequence(gameId: string, sequence: number): void {
+    this.latestSequenceByGame.set(gameId, sequence);
   }
 
   /** 订阅特定类型的事件，返回幂等退订函数。 */

@@ -134,10 +134,22 @@ const GOOD_IDENTITY_CHOICE =
   '  3. 报假身份——谎称自己是别的角色（比如平民假称神职），替真神职吸引狼人火力、混乱狼人的推断。\n' +
   '请结合本局局势自己选一种，选定后遗言里就按那个说法一贯到底，不要自相矛盾。';
 
-/**
- * BaseAgent - AI 智能体基类
- * 每个三国人物都是一个 BaseAgent 实例，拥有独立的记忆、信任矩阵和人设
- */
+export interface AgentCheckpoint {
+  memory: ChatMessage[];
+  receivedLastWords: string[];
+  lastSuspectId: string | null;
+  lastVoteTargetId: string | null;
+  keyFacts: string[];
+  selfDossier: Array<{ round: number; phase: string; memo: string; pinned?: boolean }>;
+  declaredVoteTarget: { round: number; name: string; quote: string } | null;
+  currentRound: number;
+  tacticStyle: TacticStyle | null;
+  isHumanPlayer: boolean;
+  difficulty: Difficulty;
+  seerResults: Array<{ name: string; isWolf: boolean; round: number }>;
+}
+
+/** 每个三国人物拥有独立的记忆、策略和人设。 */
 export class BaseAgent {
   private static authenticationFailureReported = false;
 
@@ -243,6 +255,39 @@ export class BaseAgent {
   // 协议值保持兼容；产品层称为“AI 思考强度”，不承诺阵营胜率或必然强弱。
   public difficulty: Difficulty = 'standard';
   public seerResults: { name: string; isWolf: boolean; round: number }[] = []; // 预言家查验记录
+
+  createCheckpoint(): AgentCheckpoint {
+    return {
+      memory: this.memory,
+      receivedLastWords: [...this.receivedLastWords],
+      lastSuspectId: this.lastSuspectId,
+      lastVoteTargetId: this.lastVoteTargetId,
+      keyFacts: this.keyFacts,
+      selfDossier: this.selfDossier,
+      declaredVoteTarget: this.declaredVoteTarget,
+      currentRound: this.currentRound,
+      tacticStyle: this.tacticStyle,
+      isHumanPlayer: this.isHumanPlayer,
+      difficulty: this.difficulty,
+      seerResults: this.seerResults,
+    };
+  }
+
+  restoreCheckpoint(checkpoint: AgentCheckpoint): void {
+    this.memory = checkpoint.memory;
+    this.receivedLastWords = new Set(checkpoint.receivedLastWords);
+    this.lastSuspectId = checkpoint.lastSuspectId;
+    this.lastVoteTargetId = checkpoint.lastVoteTargetId;
+    this.keyFacts = checkpoint.keyFacts;
+    this.selfDossier = checkpoint.selfDossier;
+    this.declaredVoteTarget = checkpoint.declaredVoteTarget;
+    this.currentRound = checkpoint.currentRound;
+    this.tacticStyle = checkpoint.tacticStyle;
+    this.isHumanPlayer = checkpoint.isHumanPlayer;
+    this.difficulty = checkpoint.difficulty;
+    this.seerResults = checkpoint.seerResults;
+    this.systemPromptCache = null;
+  }
 
   /** 返回只读副本，避免传输层接触或修改 Agent 内部记忆。 */
   getSeerResults(): ReadonlyArray<{ name: string; isWolf: boolean; round: number }> {
