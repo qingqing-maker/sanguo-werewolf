@@ -99,7 +99,7 @@ export class VoteManager {
         );
         voteResult = { targetId: input.targetId, reason: input.reason || '人类玩家选择' };
       } else {
-        voteResult = await agent.vote(context, validTargets);
+        voteResult = await agent.vote(context, validTargets, this.state.latestExileVotes?.[agent.player.id]);
       }
 
       // 校验目标合法性：非合法值视为弃票，而非随机
@@ -116,6 +116,7 @@ export class VoteManager {
         round: this.state.round,
       };
       votes.push(vote);
+      (this.state.latestExileVotes ??= {})[agent.player.id] = finalTarget;
 
       if (finalTarget === ABSTAIN) {
         console.log(`  📮 ${agent.player.name} → 弃票`);

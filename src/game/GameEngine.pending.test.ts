@@ -1,7 +1,7 @@
 import * as assert from 'node:assert/strict';
 import { BaseAgent } from '../agents/BaseAgent';
 import { CaoCaoConfig } from '../agents/characters/CaoCao';
-import { LLMProvider, LLMRequestOptions } from '../llm/LLMProvider';
+import { LLMError, LLMProvider, LLMRequestOptions } from '../llm/LLMProvider';
 import { MockProvider } from '../llm/MockProvider';
 import { RoleRegistry } from '../roles/RoleRegistry';
 import { ChatMessage, Faction, GamePhase, GameState, Player, RoleType } from '../types';
@@ -110,6 +110,49 @@ async function main(): Promise<void> {
   assert.equal(presentationEngine.receiveSpeechPresented('presentation-game', 9), true);
   await presented;
   assert.equal(presentationEngine.getPendingPresentationSequence(), null);
+
+  const retryBus = new EventBus();
+  const modelPaused = deferred<void>();
+  const retried = deferred<void>();
+  const offline = new MockProvider();
+  const recovered = new MockProvider();
+  let failedMessages: ChatMessage[] | undefined;
+  let dawns = 0;
+  let modelAttempts = 0;
+  let retryDegrades = 0;
+  offline.chatJSON = async (_system, messages) => {
+    modelAttempts++;
+    failedMessages = messages;
+    throw new LLMError('测试模拟请求失败', undefined, 'authentication');
+  };
+  const mockChatJSON = recovered.chatJSON.bind(recovered);
+  recovered.chatJSON = async <T>(...args: Parameters<LLMProvider['chatJSON']>) => {
+    modelAttempts++;
+    assert.equal(args[1], failedMessages, '续试同一组提示而非重新执行阶段');
+    const result = await mockChatJSON<T>(...args);
+    retried.resolve();
+    return result;
+  };
+  retryBus.on('game_paused', event => {
+    assert.equal(event.data.modelFailure, 'authentication');
+    modelPaused.resolve();
+  });
+  retryBus.on('phase_change', () => { dawns++; });
+  retryBus.on('ai_decision_degraded', () => { retryDegrades++; });
+  const recoveryEngine = new GameEngine(RoleRegistry.getDefaultConfig(), offline, {
+    eventBus: retryBus, retryModel: () => recovered,
+  });
+  const recoveryRun = recoveryEngine.start();
+  await modelPaused.promise;
+  assert.equal(recoveryEngine.paused, true);
+  assert.equal(recoveryEngine.modelFailure, 'authentication');
+  assert.equal(modelAttempts, 1);
+  recoveryEngine.resume();
+  await retried.promise;
+  recoveryEngine.cancel();
+  await recoveryRun;
+  assert.equal(dawns, 1);
+  assert.equal(retryDegrades, 0);
 
   const cancelledPresentation = presentationEngine.waitForSpeechPresentation(10, '取消中的发言');
   presentationEngine.cancel();

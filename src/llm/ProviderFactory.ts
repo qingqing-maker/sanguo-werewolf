@@ -93,6 +93,7 @@ export interface ProviderFactoryOptions {
   eventBus?: EventPublisher;
   ledger?: BudgetLedger;
   breaker?: LLMCircuitBreaker;
+  disableFallback?: boolean;
 }
 
 export function createLLMProvider(
@@ -115,7 +116,7 @@ export function createLLMProvider(
   const primary = buildPrimary(normalized, breaker, ledger);
 
   // Fallback 策略仅在真实 Provider 上生效。mock 已经是"最后一档"，无需再包一层。
-  const strategy = readFallbackStrategy();
+  const strategy = options.disableFallback ? 'none' : readFallbackStrategy();
   if (strategy === 'none') return primary;
 
   console.log(`[LLM] fallback 策略=${strategy}，backup=mock（真实调用失败时按策略切换）`);

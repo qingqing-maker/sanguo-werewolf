@@ -53,6 +53,7 @@ class FakeElement {
     this.parentNode = null;
   }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  setAttribute(name, value) { this[name] = String(value); }
   getBoundingClientRect() { return { top: 0, bottom: this.clientHeight }; }
   querySelectorAll() { return []; }
   querySelector(selector) {
@@ -483,10 +484,63 @@ async function main() {
     speeches.forEach(({ type, data, name }, index) => {
       socket.message({ type, data: { ...data, gameId: 'g1', speech: '我是典韦。' }, sequence: index + 2 });
       const [avatar, label, badge] = h.document.getElementById('dialogueArea').children.at(-1).children[0].children;
-      assert.equal(avatar.children[0].src, 'images/portraits/dian-wei.webp');
+      assert.equal(avatar.children[0].children[0].src, 'images/portraits/dian-wei.webp');
       assert.equal(label.textContent, name);
       assert.equal(badge.textContent, '你');
     });
+  });
+
+  await check('大厅展示存档阶段，点继续才恢复并继续原局', () => {
+    const h = makeHarness();
+    h.context.localStorage.setItem('sanguo-game-checkpoint', JSON.stringify({ gameId: 'g1', value: 'v1.saved', round: 2, phase: 'day', savedAt: 1800000000000 }));
+    const first = h.sockets[0];
+    first.open();
+    assert.equal(first.sent[0].deferCheckpoint, true);
+    first.message(authenticated({ checkpointStatus: 'available' }));
+    assert.equal(h.document.getElementById('lobbySave').hidden, false);
+    assert.match(h.document.getElementById('lobbySaveInfo').textContent, /已保存到第 2 轮白天/);
+    h.evaluate('continueSavedGame()');
+    const second = h.sockets[1];
+    second.open();
+    assert.equal(second.sent[0].checkpoint, 'v1.saved');
+    assert.equal(second.sent[0].deferCheckpoint, undefined);
+    second.message(authenticated({ isHost: true, state: { ...state('g1', true), paused: true }, checkpointStatus: 'restored' }));
+    assert.equal(second.sent.at(-1).type, 'resume_game');
+  });
+
+  await check('线索板记录公开自称、质疑与票型，刷新沿用本局私有标记', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    const list = [{ id: 'p1', name: '周瑜' }, { id: 'p2', name: '曹操' }];
+    socket.message(authenticated());
+    socket.message({ type: 'game_start', data: { gameId: 'g1', players: list }, sequence: 1 });
+    socket.message({ type: 'phase_change', data: { gameId: 'g1', phase: 'day', round: 2 }, sequence: 2 });
+    socket.message({ type: 'player_speak', data: { gameId: 'g1', playerId: 'p1', playerName: '周瑜', publicSpeech: '我是预言家，怀疑曹操。', innerThoughts: '隐私' }, sequence: 3 });
+    socket.message({ type: 'player_vote', data: { gameId: 'g1', voterId: 'p1', voterName: '周瑜', targetId: 'p2', targetName: '曹操', reason: '私下想法' }, sequence: 4 });
+    const notes = h.evaluate('JSON.stringify([...clueRows])');
+    assert.match(notes, /自称预言家/);
+    assert.match(notes, /受到周瑜质疑/);
+    assert.match(notes, /投给 曹操/);
+    assert.doesNotMatch(notes, /隐私|私下想法/);
+    h.evaluate('cluePerson = "p2"; setClueMark("suspect"); resetClueBoard("g1");');
+    assert.equal(h.evaluate('clueMarks.p2'), 'suspect');
+    h.evaluate('resetClueBoard("g2")');
+    assert.equal(h.evaluate('clueMarks.p2'), undefined);
+  });
+
+  await check('模型故障重连仍显示重试，恢复后清除故障提示', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated({ isHost: true, state: { ...state('g1', true), paused: true, modelFailure: 'timeout' } }));
+    assert.equal(h.document.getElementById('btnMobilePause').textContent, '重试 AI');
+    assert.match(h.document.getElementById('modelRetryNotice').textContent, /模型请求超时/);
+    h.evaluate('toggleMatchPause()');
+    assert.equal(socket.sent.at(-1).type, 'resume_game');
+    socket.message({ type: 'game_resumed', data: { gameId: 'g1' }, sequence: 1 });
+    assert.equal(h.document.getElementById('modelRetryNotice').hidden, true);
+    assert.equal(h.document.getElementById('btnMobilePause').textContent, '暂停');
   });
 
   await check('下一名角色的文字等待上一段 TTS 播放结束后才显示', async () => {

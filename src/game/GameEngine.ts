@@ -4,7 +4,7 @@ import { AgentFactory } from '../agents/AgentFactory';
 import { RoleRegistry } from '../roles/RoleRegistry';
 import { PhaseManager } from './PhaseManager';
 import { VoteManager } from './VoteManager';
-import { LLMProvider } from '../llm/LLMProvider';
+import { LLMError, LLMErrorKind, LLMProvider } from '../llm/LLMProvider';
 import { EventPublisher, globalEventBus } from './EventBus';
 import { estimateSpeechBaseMs, scalePacingMs } from './pacing';
 import { PhaseNode, TransitionSignal, nextPhase } from './PhaseMachine';
@@ -84,6 +84,7 @@ export interface GameEngineOptions {
   /** Web 模式由主持人浏览器在文字展示且 TTS 播放结束后回执；CLI/测试默认仍按字数估时。 */
   presentationAckEnabled?: boolean;
   onPhaseBoundary?: (checkpoint: GameCheckpoint) => void;
+  retryModel?: () => LLMProvider;
 }
 
 export interface GameCheckpoint {
@@ -126,6 +127,7 @@ export class GameEngine {
   // 暂停/取消控制
   private _paused = false;
   private _cancelled = false;
+  private _modelFailure: LLMErrorKind | null = null;
   private abortController = new AbortController();
   private _pausePromise: Promise<void> | null = null;
   private _pauseResolve: (() => void) | null = null;
@@ -140,12 +142,38 @@ export class GameEngine {
     this.eventBus = options.eventBus ?? globalEventBus;
     this.presentationAckEnabled = options.presentationAckEnabled ?? false;
     this.onPhaseBoundary = options.onPhaseBoundary;
+    if (options.retryModel) this.llm = this.wrapModel(llm, options.retryModel);
     this.sheriffTransferRandom = this.random.fork('sheriff-transfer');
     this.gameId = (options.idFactory ?? randomUUID)();
   }
 
   get paused(): boolean { return this._paused; }
   get cancelled(): boolean { return this._cancelled; }
+  get modelFailure(): LLMErrorKind | null { return this._modelFailure; }
+
+  private wrapModel(initial: LLMProvider, reconnect: () => LLMProvider): LLMProvider {
+    let provider = initial;
+    const run = async <T>(call: (current: LLMProvider) => Promise<T>): Promise<T> => {
+      let retry = false;
+      for (;;) {
+        await this.checkpoint();
+        try {
+          if (retry) provider = reconnect();
+          return await call(provider);
+        } catch (error: unknown) {
+          if (this._cancelled) throw error;
+          this._modelFailure = error instanceof LLMError ? error.kind : 'unknown';
+          if (this._paused) this.eventBus.emit('game_paused', { modelFailure: this._modelFailure });
+          else this.pause();
+          retry = true;
+        }
+      }
+    };
+    return {
+      chat: (...args) => run(current => current.chat(...args)),
+      chatJSON: <T>(...args: Parameters<LLMProvider['chatJSON']>) => run(current => current.chatJSON<T>(...args)),
+    };
+  }
 
   /**
    * 获取当前所有玩家信息
@@ -206,7 +234,7 @@ export class GameEngine {
         this._pauseResolve = resolve;
       });
       console.log('[Engine] 游戏已暂停');
-      this.eventBus.emit('game_paused', {});
+      this.eventBus.emit('game_paused', this._modelFailure ? { modelFailure: this._modelFailure } : {});
     }
   }
 
@@ -216,6 +244,7 @@ export class GameEngine {
   resume(): void {
     if (this._paused && this._pauseResolve) {
       this._paused = false;
+      this._modelFailure = null;
       this._pauseResolve();
       this._pausePromise = null;
       this._pauseResolve = null;
@@ -407,6 +436,7 @@ export class GameEngine {
   private async startInContext(onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, checkpoint?: GameCheckpoint): Promise<void> {
     this._paused = false;
     this._cancelled = false;
+    this._modelFailure = null;
     if (this.abortController.signal.aborted) this.abortController = new AbortController();
 
     this.printBanner();
