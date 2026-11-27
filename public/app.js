@@ -24,6 +24,13 @@ let ignoredReplayGameId = null;
 // transport 消息不参与；legacy 无 sequence 仍可播放，但无法保证去重。
 const eventSequenceGuard = EventSequence.createEventSequenceGuard();
 const GAME_CHECKPOINT_KEY = 'sanguo-game-checkpoint';
+const HOST_ROOM_KEY = 'sanguo-host-room';
+const ROOM_LINK_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const linkedRoom = new URLSearchParams(location.search).get('room');
+const preferredRoom = linkedRoom || localStorage.getItem(HOST_ROOM_KEY);
+let selectedRoomId = ROOM_LINK_PATTERN.test(preferredRoom || '') ? preferredRoom : null;
+let roomGateway = false;
+let roomRequestPending = false;
 let checkpointRequested = false;
 let modelFailure = null;
 let modelAlertToast = null;
@@ -56,6 +63,17 @@ let authenticatedGeneration = 0;
 // AI 思考强度的兼容协议值：novice / standard / expert。
 // 观战与参战两条路径都会读取这个值，默认 standard。
 let aiDifficulty = 'standard';
+
+function roomApi(path) {
+  return selectedRoomId ? `${path}?room=${encodeURIComponent(selectedRoomId)}` : path;
+}
+
+function roomPage(roomId) {
+  const params = new URLSearchParams(location.search);
+  if (roomId) params.set('room', roomId);
+  else params.delete('room');
+  return (location.pathname || '/') + (params.size ? `?${params}` : '');
+}
 
 // 难度选项的一句话说明，切换 radio 时更新提示文案。
 const AI_DIFFICULTY_HINTS = {
@@ -146,7 +164,7 @@ let ttsEpoch = 0;
 async function refreshBackendTtsStatus() {
   if (!authenticated) return;
   try {
-    const r = await fetch('/api/tts/status', { headers: { Authorization: `Bearer ${sessionToken}` }, cache: 'no-store' });
+    const r = await fetch(roomApi('/api/tts/status'), { headers: { Authorization: `Bearer ${sessionToken}` }, cache: 'no-store' });
     const j = await r.json().catch(() => ({}));
     backendTtsAvailable = r.ok && !!j.enabled;
     if (j.quotaExhausted) notifyTtsQuotaExhausted();
@@ -373,7 +391,7 @@ async function processQueue() {
   // 优先：后端火山方舟 TTS
   if (backendTtsAvailable) {
     try {
-      const resp = await fetch('/api/tts', {
+      const resp = await fetch(roomApi('/api/tts'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -495,7 +513,7 @@ function connectWebSocket() {
   const generation = ++connectionGeneration;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${protocol}//${location.host}`);
+  const socket = new WebSocket(`${protocol}//${location.host}${selectedRoomId ? roomApi('/') : ''}`);
   ws = socket;
   let offeredCheckpoint = false;
 
@@ -653,6 +671,7 @@ function processEvent(msg) {
         scrollViewReady = false;
       }
       authenticated = true;
+      roomGateway = !!msg.data.roomGateway;
       supportsPageVisibility = !!msg.data.supportsPageVisibility;
       if (document.hidden) reportPageVisibility(false);
       void refreshBackendTtsStatus();
@@ -662,6 +681,9 @@ function processEvent(msg) {
       mySeatId = msg.data.seatId || null;
       capabilities = msg.data.capabilities || {};
       roomState = msg.data.room || roomState;
+      if (roomGateway && roomState.isCreator && roomState.roomId) {
+        localStorage.setItem(HOST_ROOM_KEY, roomState.roomId);
+      }
       document.body.classList.toggle('human-mode', !!mySeatId);
       if (state) {
         renderModelInfo(state.model);
@@ -677,6 +699,8 @@ function processEvent(msg) {
           addSystemMessage(msg.data.checkpointStatus === 'restored'
             ? (requestedSave ? '📜 已恢复最近存档。' : '📜 已恢复最近存档。点击「继续」接着玩。')
             : '🔄 已连接服务器，以上为当前对局的完整公共时间线。');
+        } else if (wasReconnect && believedGameRunning && roomGateway && !roomState.exists) {
+          resetToWelcome();
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
         } else if (!hasReplay) {
@@ -687,7 +711,7 @@ function processEvent(msg) {
       if (msg.data.pendingInput && serverRunning) showHumanInputPanel(msg.data.pendingInput);
       handleCheckpointStatus(msg.data.checkpointStatus);
       if (requestedSave && msg.data.checkpointStatus === 'restored') resumeGame();
-      else if (requestedSave && !msg.data.checkpointStatus) showToast('暂时无法续局', '请确认房间空闲后重试。', 'warn');
+      else if (requestedSave && !serverRunning && !msg.data.checkpointStatus) showToast('暂时无法续局', '请确认房间空闲后重试。', 'warn');
       updateControlButtons();
       if (didReconnect) addLog('已重新连接到服务器', 'system');
       if (!hasReplay && !scrollViewReady) restoreScrollView(serverRunning ? state.gameId : null);
@@ -695,6 +719,11 @@ function processEvent(msg) {
       break;
     }
     case 'session_updated':
+      if (roomGateway && isHost && msg.data.isHost === false && !msg.data.room?.exists) {
+        if (localStorage.getItem(HOST_ROOM_KEY) === selectedRoomId) localStorage.removeItem(HOST_ROOM_KEY);
+        switchRoom(null);
+        break;
+      }
       if (typeof msg.data.isHost === 'boolean') isHost = msg.data.isHost;
       if (typeof msg.data.isPresentationClient === 'boolean') {
         applyPresentationRole(msg.data.isPresentationClient, msg.data.pendingPresentationSequence, msg.data.presentationToken);
@@ -901,13 +930,18 @@ function processEvent(msg) {
 }
 
 function readGameCheckpoint() {
-  try { return JSON.parse(localStorage.getItem(GAME_CHECKPOINT_KEY)); }
+  try {
+    const saved = JSON.parse(localStorage.getItem(GAME_CHECKPOINT_KEY));
+    return !selectedRoomId || saved?.roomId === selectedRoomId || (!saved?.roomId && checkpointRequested) ? saved : null;
+  }
   catch (_) { return null; }
 }
 
 function continueSavedGame() {
-  if (!authenticated || gameStarted || checkpointRequested || !readGameCheckpoint()?.value) return;
+  const save = readGameCheckpoint();
+  if (!authenticated || gameStarted || checkpointRequested || !save?.value) return;
   if (roomState.exists && !roomState.isCreator) return;
+  if (roomGateway && !roomState.exists) { void requestRoom(save); return; }
   checkpointRequested = true;
   authenticated = false;
   updateCheckpointUI();
@@ -926,7 +960,7 @@ function updateCheckpointUI() {
   lobbySave.hidden = !save?.value || gameStarted || replaying;
   document.getElementById('lobbySaveInfo').textContent = caption;
   const resume = document.getElementById('btnContinueSaved');
-  resume.disabled = !authenticated || checkpointRequested || (roomState.exists && !roomState.isCreator);
+  resume.disabled = !authenticated || checkpointRequested || roomRequestPending || (roomState.exists && !roomState.isCreator);
   resume.textContent = checkpointRequested ? '正在恢复…' : '继续上局';
   const matchSave = document.getElementById('matchSaveStatus');
   matchSave.hidden = !gameStarted || replaying || !isHost || !save?.value || save.gameId !== currentGameId;
@@ -934,7 +968,8 @@ function updateCheckpointUI() {
 }
 
 function discardGameCheckpoint(gameId) {
-  if (gameId && readGameCheckpoint()?.gameId !== gameId) return;
+  const saved = readGameCheckpoint();
+  if (!saved || (gameId && saved.gameId !== gameId)) return;
   try { localStorage.removeItem(GAME_CHECKPOINT_KEY); }
   catch (_) { /* 浏览器未允许写入。 */ }
 }
@@ -1473,8 +1508,75 @@ async function saveSettings() {
 
 function createRoom() {
   if (ws && ws.readyState === WebSocket.OPEN && authenticated && capabilities.createRoom) {
+    if (roomGateway) { void requestRoom(); return; }
     ws.send(JSON.stringify({ type: 'create_room' }));
     addLog('正在创建单实例房间...', 'system');
+  }
+}
+
+async function requestRoom(save) {
+  if (roomRequestPending) return;
+  roomRequestPending = true;
+  updateControlButtons();
+  try {
+    const response = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${sessionToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(save ? { checkpoint: save.value } : {}),
+    });
+    const result = await response.json();
+    if (response.ok && ROOM_LINK_PATTERN.test(result.roomId || '')) {
+      localStorage.setItem(HOST_ROOM_KEY, result.roomId);
+      if (save && !save.roomId) {
+        localStorage.setItem(GAME_CHECKPOINT_KEY, JSON.stringify({ ...save, roomId: result.roomId }));
+      }
+      switchRoom(result.roomId, !!save);
+    } else {
+      if (result.reason === 'invalid_checkpoint' || result.reason === 'ended_checkpoint') discardGameCheckpoint();
+      const descriptions = {
+        rooms_full: '房间已满，请稍后再试。',
+        invalid_checkpoint: '这份存档无法打开。',
+        ended_checkpoint: '这局已经结束。',
+        room_exists: '此浏览器还有一个主持中的房间。',
+        room_taken: '房间正在释放，请稍后再试。',
+      };
+      showToast(save ? '暂时无法续局' : '暂时无法创建房间', descriptions[result.reason] || '请稍后重试。', 'warn');
+    }
+  } catch (_) {
+    showToast('连接服务器失败', '请稍后重试。', 'warn');
+  } finally {
+    roomRequestPending = false;
+    updateControlButtons();
+  }
+}
+
+function switchRoom(roomId, restore = false) {
+  const previousSocket = ws;
+  selectedRoomId = roomId;
+  history.replaceState(null, '', roomPage(roomId));
+  resetToWelcome();
+  authenticated = false;
+  isHost = false;
+  roomState = { exists: false, roomId: null, isCreator: false };
+  checkpointRequested = restore;
+  connectWebSocket();
+  previousSocket?.close();
+  updateControlButtons();
+}
+
+function leaveRoom() {
+  const ownRoom = localStorage.getItem(HOST_ROOM_KEY);
+  switchRoom(ROOM_LINK_PATTERN.test(ownRoom || '') && ownRoom !== selectedRoomId ? ownRoom : null);
+}
+
+async function copyRoomLink() {
+  if (!roomState.roomId || !roomGateway) return;
+  const link = new URL(roomPage(roomState.roomId), location.href).href;
+  try {
+    await navigator.clipboard.writeText(link);
+    showToast('观战链接已复制', '朋友打开后可观看这场对局。');
+  } catch (_) {
+    window.prompt('复制观战链接', link);
   }
 }
 
@@ -1494,7 +1596,8 @@ function updateRoomControls() {
 
   if (createBtn) {
     createBtn.style.display = authenticated && !roomState.exists ? 'inline-flex' : 'none';
-    createBtn.disabled = !authenticated || !capabilities.createRoom;
+    createBtn.disabled = !authenticated || !capabilities.createRoom || roomRequestPending;
+    createBtn.textContent = roomRequestPending ? '正在连接…' : '创建房间';
   }
   if (closeBtn) {
     closeBtn.style.display = authenticated && roomState.isCreator && !gameStarted ? 'inline-flex' : 'none';
@@ -1502,10 +1605,14 @@ function updateRoomControls() {
   }
   const pickerOpen = document.getElementById('characterPicker').style.display === 'block';
   if (modeSelect) modeSelect.style.display = roomState.isCreator && !gameStarted && !pickerOpen ? 'flex' : 'none';
-  if (settingsBtn) settingsBtn.style.display = roomState.isCreator ? 'inline-flex' : 'none';
+  if (settingsBtn) settingsBtn.style.display = roomState.isCreator && !roomGateway ? 'inline-flex' : 'none';
+  document.getElementById('btnShareRoom').hidden = !authenticated || !roomGateway || !roomState.exists;
+  document.getElementById('btnLeaveRoom').hidden = !authenticated || !roomGateway || !selectedRoomId || roomState.isCreator;
   if (status) {
     if (!authenticated) status.textContent = '正在连接服务器…';
-    else if (!roomState.exists) status.textContent = '当前没有房间。创建后你会自动成为主持人。';
+    else if (!roomState.exists) status.textContent = selectedRoomId && roomGateway
+      ? '该房间当前未开放。可以创建自己的房间，或等待主持人回来。'
+      : '创建自己的房间后，可以直接开局。';
     else if (roomState.isCreator) status.textContent = '你创建了当前房间，并自动成为主持人。';
     else status.textContent = '当前已有房间，你可以观战；控制权属于房间创建者。';
   }

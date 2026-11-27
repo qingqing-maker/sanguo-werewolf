@@ -19,17 +19,21 @@ export class EventLog {
   private maxGames: number;
 
   constructor(dir?: string, maxGames = 20) {
-    const configuredDir = process.env.EVENT_LOG_DIR?.trim();
-    const dataDir = process.env.DATA_DIR?.trim();
-    this.dir = dir || configuredDir || (dataDir
-      ? path.resolve(dataDir, 'game-logs')
-      : path.resolve(__dirname, '../../game-logs'));
+    this.dir = dir || EventLog.defaultDirectory();
     this.maxGames = maxGames;
     try {
       fs.mkdirSync(this.dir, { recursive: true });
     } catch (e: unknown) {
       console.warn(`[EventLog] 创建日志目录失败: ${this.errorMessage(e)}`);
     }
+  }
+
+  static defaultDirectory(): string {
+    const configuredDir = process.env.EVENT_LOG_DIR?.trim();
+    const dataDir = process.env.DATA_DIR?.trim();
+    return configuredDir || (dataDir
+      ? path.resolve(dataDir, 'game-logs')
+      : path.resolve(__dirname, '../../game-logs'));
   }
 
   /** 记录事件；任意带 gameId 的首条事件都可以建立当前日志。 */

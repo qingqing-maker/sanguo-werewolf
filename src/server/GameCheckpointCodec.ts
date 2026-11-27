@@ -11,9 +11,18 @@ const TAG_BYTES = 16;
 const RESUMABLE_PHASES = new Set([PhaseNode.NIGHT, PhaseNode.DAWN, PhaseNode.DAY, PhaseNode.VOTE]);
 
 export interface SavedGame {
+  roomId?: string;
   checkpoint: GameCheckpoint;
   timeline: GameUIEvent[];
   sequence: number;
+}
+
+export const ROOM_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function createCheckpointCodec(key?: string): GameCheckpointCodec | undefined {
+  const fallback = (process.env.LLM_API_KEY || process.env.OPENAI_API_KEY)?.trim();
+  const secret = key ?? (process.env.GAME_SAVE_KEY?.trim() || fallback);
+  return secret ? new GameCheckpointCodec(secret, key === undefined ? fallback : undefined) : undefined;
 }
 
 export function isCheckpointToken(value: unknown): value is string {
@@ -55,6 +64,7 @@ export class GameCheckpointCodec {
         const compressed = Buffer.concat([decipher.update(bytes.subarray(NONCE_BYTES + TAG_BYTES)), decipher.final()]);
         const saved = JSON.parse(inflateRawSync(compressed, { maxOutputLength: MAX_CHECKPOINT_JSON }).toString('utf8')) as SavedGame;
         const checkpoint = saved?.checkpoint;
+        if (saved.roomId !== undefined && (typeof saved.roomId !== 'string' || !ROOM_ID_PATTERN.test(saved.roomId))) return null;
         if (!checkpoint || typeof checkpoint.gameId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(checkpoint.gameId)
           || !RESUMABLE_PHASES.has(checkpoint.nextPhase) || !checkpoint.config
           || !Array.isArray(checkpoint.state?.players) || !Array.isArray(checkpoint.agents)

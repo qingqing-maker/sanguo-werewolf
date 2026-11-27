@@ -19,7 +19,7 @@ export interface SessionRegistryOptions {
   idleTtlMs?: number;
 }
 
-/** 进程内连接级会话表；单实例只允许一个房间，创建者自动成为主持人。 */
+/** 房间内的连接级会话表，创建者自动成为主持人。 */
 export class SessionRegistry {
   private readonly sessionsByHash = new Map<string, SessionRecord>();
   private readonly maxSessions: number;
@@ -57,15 +57,15 @@ export class SessionRegistry {
     return session;
   }
 
-  /** 创建单实例房间；同一时刻只有一个会话能成功，创建者自动成为主持人。 */
-  createRoom(session: SessionRecord): CreateRoomResultCode {
+  /** 为本会话表绑定房间和创建者。 */
+  createRoom(session: SessionRecord, roomId: string = randomUUID()): CreateRoomResultCode {
     if (!this.hasSession(session)) return 'unknown_session';
     if (session.isHost && this.roomCreatorSession === session) return 'already_creator';
     if (this.roomCreatorSession) return 'room_taken';
     session.isHost = true;
     session.lastAccessAt = Date.now();
     this.roomCreatorSession = session;
-    this.roomId = randomUUID();
+    this.roomId = roomId;
     return 'created';
   }
 
