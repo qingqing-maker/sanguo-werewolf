@@ -59,7 +59,9 @@ async function main(): Promise<void> {
     { id: 'seer', name: '军师', title: '卧龙', roleType: RoleType.SEER, faction: Faction.GOOD, isAlive: true, wolfPartners: ['secret'] },
     { id: 'wolf', name: '狼一', title: '奸雄', roleType: RoleType.WEREWOLF, faction: Faction.WOLF, isAlive: true, wolfPartners: ['wolf2'] },
   ];
-  const start = makeEvent('game_start', { players, config: { playerCount: 2, roles: [RoleType.SEER, RoleType.WEREWOLF], maxRounds: 3, enableInnerThoughts: true } });
+  const start = makeEvent('game_start', { players, model: 'match-model', config: { playerCount: 2, roles: [RoleType.SEER, RoleType.WEREWOLF], maxRounds: 3, enableInnerThoughts: true } });
+  assert.equal(data(projectEventForViewer(start, viewers.restricted)).model, 'match-model');
+  assert.equal(data(projectEventForPublicReplay(start)).model, 'match-model');
   const restrictedPlayers = data(projectEventForViewer(start, viewers.restricted)).players as Array<Record<string, unknown>>;
   assert.equal(restrictedPlayers[0].roleType, undefined);
   assert.equal(restrictedPlayers[1].wolfPartners, undefined);

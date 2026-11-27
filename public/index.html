@@ -9,23 +9,23 @@
   <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="lobby-view">
   <div id="app">
     <!-- 顶部横幅 -->
     <header class="header">
       <div class="header-content">
-        <h1 class="title">⚔️ 三国狼人杀</h1>
+        <h1 class="title"><img class="brand-seal" src="images/wolf-seal.png" alt="" width="36" height="36">三国狼人杀</h1>
         <div class="header-controls">
           <span class="phase-badge" id="phaseBadge">等待开始</span>
           <span class="round-info" id="roundInfo"></span>
           <span class="difficulty-badge" id="difficultyBadge" style="display:none"></span>
           <div class="control-btns" id="controlBtns" style="display:none">
-            <button class="btn-ctrl btn-pause" id="btnPause" onclick="pauseGame()">⏸ 暂停</button>
-            <button class="btn-ctrl btn-resume" id="btnResume" onclick="resumeGame()" style="display:none">▶ 继续</button>
-            <button class="btn-ctrl btn-restart" id="btnRestart" onclick="restartGame()" title="停掉当前对局，回欢迎页重新选择难度和模式">🔄 再来一局</button>
+            <button class="btn-ctrl btn-pause" id="btnPause" onclick="pauseGame()">暂停</button>
+            <button class="btn-ctrl btn-resume" id="btnResume" onclick="resumeGame()" style="display:none">继续</button>
+            <button class="btn-ctrl btn-restart" id="btnRestart" onclick="restartGame()" title="停掉当前对局，回欢迎页重新选择难度和模式">再来一局</button>
             <button class="btn-ctrl" id="btnTts" onclick="toggleTts()" title="开关语音">🔊 语音</button>
           </div>
-          <button class="btn-ctrl btn-settings" id="btnSettings" onclick="openSettings()" title="设置" style="display:none">⚙️ 设置</button>
+          <button class="btn-ctrl btn-settings" id="btnSettings" onclick="openSettings()" style="display:none">设置</button>
         </div>
       </div>
     </header>
@@ -34,66 +34,61 @@
     <main class="main">
       <!-- 左侧角色面板 -->
       <aside class="panel-left">
-        <h2 class="panel-title">👥 角色列表</h2>
-        <div class="player-list" id="playerList">
-          <div class="empty-state">等待游戏开始...</div>
-        </div>
+        <h2 class="panel-title">人物名册</h2>
+        <div class="player-list" id="playerList"></div>
         <div class="model-info" id="modelInfo"></div>
       </aside>
 
       <!-- 中央对话区 -->
       <section class="center-stage">
+        <h2 class="panel-title stage-title" id="stageTitle">对局现场</h2>
         <div class="dialogue-area" id="dialogueArea">
           <div class="welcome-message" id="welcomePanel">
-            <div class="welcome-icon">🏯</div>
-            <h2>三国狼人杀</h2>
-            <p>十二位三国英雄，暗藏四名细作</p>
-            <p>谁是忠臣？谁是奸贼？一切由 AI 定夺</p>
-            <!-- AI 思考强度：控制记忆与策略材料，不承诺阵营胜率 -->
-            <div class="difficulty-bar" id="aiDifficultyBar">
-              <span class="difficulty-label">AI 思考强度</span>
-              <div class="difficulty-options">
-                <label class="difficulty-option">
-                  <input type="radio" name="aiDifficulty" value="novice" onchange="setAiDifficulty('novice')">
-                  <span>轻量</span>
-                </label>
-                <label class="difficulty-option">
-                  <input type="radio" name="aiDifficulty" value="standard" checked onchange="setAiDifficulty('standard')">
-                  <span>标准</span>
-                </label>
-                <label class="difficulty-option">
-                  <input type="radio" name="aiDifficulty" value="expert" onchange="setAiDifficulty('expert')">
-                  <span>深度</span>
-                </label>
-              </div>
-              <p class="difficulty-hint" id="difficultyHint">标准思考：中等记忆、近期关键事实和常规策略</p>
-              <p class="difficulty-hint">说明：双方 AI 会同时增强，档位不保证某个阵营胜率单调变化。</p>
-            </div>
-            <div class="room-entry" id="roomEntry" style="display:flex; flex-direction:column; align-items:center; gap:10px; margin:14px 0;">
-              <p id="roomStatus" class="difficulty-hint">正在连接服务器…</p>
-              <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
-                <button type="button" class="btn-start" id="btnCreateRoom" onclick="createRoom()" style="display:none">
-                  🏠 创建房间
-                </button>
-                <button type="button" class="btn-start btn-back" id="btnCloseRoom" onclick="closeRoom()" style="display:none">
-                  关闭房间
-                </button>
+            <div class="welcome-hero">
+              <div class="welcome-copy">
+                <h2>三国狼人杀</h2>
+                <p>十二位三国英雄，暗藏四名细作。</p>
+                <p>旁观 AI 交锋，或亲自入局寻出细作。</p>
               </div>
             </div>
-            <!-- 模式选择：观战（全 AI）或参战（选一个人物加入） -->
-            <div class="mode-select" id="modeSelect" style="display:none">
-              <button class="btn-start" id="btnStart" onclick="startGame()">
-                ⚔️ 开始观战（全 AI）
-              </button>
-              <button class="btn-start btn-join" id="btnJoin" onclick="showCharacterPicker()">
-                🙋 加入游戏
-              </button>
-            </div>
-            <!-- 人物选择网格：点「加入游戏」后展开 -->
-            <div class="character-picker" id="characterPicker" style="display:none">
-              <p class="picker-hint">选择你要扮演的人物（身份随机分配）：</p>
-              <div class="character-grid" id="characterGrid"></div>
-              <button class="btn-start btn-back" onclick="hideCharacterPicker()">← 返回</button>
+            <div class="lobby-card">
+              <h3>对局设置</h3>
+              <fieldset class="difficulty-bar" id="aiDifficultyBar">
+                <legend class="difficulty-label">AI 思考强度</legend>
+                <div class="difficulty-options">
+                  <label class="difficulty-option">
+                    <input type="radio" name="aiDifficulty" value="novice" onchange="setAiDifficulty('novice')">
+                    <span>轻量</span>
+                  </label>
+                  <label class="difficulty-option">
+                    <input type="radio" name="aiDifficulty" value="standard" checked onchange="setAiDifficulty('standard')">
+                    <span>标准</span>
+                  </label>
+                  <label class="difficulty-option">
+                    <input type="radio" name="aiDifficulty" value="expert" onchange="setAiDifficulty('expert')">
+                    <span>深度</span>
+                  </label>
+                </div>
+                <p class="difficulty-hint" id="difficultyHint">标准思考：中等记忆、近期关键事实和常规策略</p>
+                <p class="difficulty-hint difficulty-note">双方 AI 会同时增强，胜率变化取决于对局表现。</p>
+              </fieldset>
+              <div class="room-entry" id="roomEntry">
+                <p id="roomStatus" class="difficulty-hint" role="status">正在连接服务器…</p>
+                <div class="room-actions">
+                  <div class="mode-select" id="modeSelect" style="display:none">
+                    <button class="btn-start" id="btnStart" onclick="startGame()">开始观战</button>
+                    <button class="btn-start btn-back" id="btnJoin" onclick="showCharacterPicker()">加入对局</button>
+                  </div>
+                  <button type="button" class="btn-start" id="btnCreateRoom" onclick="createRoom()" style="display:none">创建房间</button>
+                  <button type="button" class="btn-start btn-back btn-close-room" id="btnCloseRoom" onclick="closeRoom()" style="display:none">关闭房间</button>
+                </div>
+              </div>
+              <div class="character-picker" id="characterPicker" style="display:none">
+                <h4>选择人物</h4>
+                <p class="picker-hint">选择你要扮演的人物，身份将在开局时随机分配。</p>
+                <div class="character-grid" id="characterGrid"></div>
+                <button class="btn-start btn-back" onclick="hideCharacterPicker()">返回</button>
+              </div>
             </div>
           </div>
         </div>
@@ -111,7 +106,7 @@
 
       <!-- 右侧信息栏 -->
       <aside class="panel-right">
-        <h2 class="panel-title">📜 事件日志</h2>
+        <h2 class="panel-title">事件日志</h2>
         <div class="event-log" id="eventLog">
           <div class="log-entry log-system">等待连接服务器...</div>
         </div>
@@ -127,9 +122,9 @@
     <div class="modal">
       <div class="modal-header" id="modalHeader">🏆 游戏结束</div>
       <div class="modal-body" id="modalBody"></div>
-      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
-        <button class="btn-start" onclick="closeModal(); showRestartButton();" style="background:linear-gradient(135deg,#4a90d9,#357abd);">📋 返回复盘</button>
-        <button class="btn-start" onclick="resetToWelcome()">🔄 再来一局</button>
+      <div class="modal-actions">
+        <button class="btn-start btn-back" onclick="closeModal(); showRestartButton();">返回复盘</button>
+        <button class="btn-start" onclick="resetToWelcome()">再来一局</button>
       </div>
     </div>
   </div>
@@ -206,9 +201,9 @@
         </div>
         <div class="settings-msg" id="settingsMsg"></div>
       </div>
-      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
-        <button class="btn-start" onclick="saveSettings()">💾 保存</button>
-        <button class="btn-start btn-back" onclick="closeSettings()">← 关闭</button>
+      <div class="modal-actions">
+        <button class="btn-start" onclick="saveSettings()">保存</button>
+        <button class="btn-start btn-back" onclick="closeSettings()">关闭</button>
       </div>
     </div>
   </div>
@@ -216,7 +211,7 @@
   <!-- 合规声明弹窗：首次访问强制展示，用户勾选同意后写 localStorage，之后不再弹 -->
   <div id="complianceModal" class="modal-overlay" style="display:none;">
     <div class="modal" style="max-width:520px;">
-      <h2 style="margin:0 0 12px 0;">📢 使用声明</h2>
+      <h2 class="modal-header">使用声明</h2>
       <div style="text-align:left; line-height:1.7; font-size:0.9rem; color:var(--text-primary);">
         <p><strong>关于本游戏：</strong></p>
         <ul style="padding-left:20px; margin:6px 0 12px 0;">
@@ -231,7 +226,7 @@
           <span>我已阅读并同意上述内容</span>
         </label>
       </div>
-      <div style="display:flex; gap:12px; justify-content:center; margin-top:16px;">
+      <div class="modal-actions">
         <button class="btn-start" id="btnComplianceOk" onclick="acceptCompliance()" disabled>进入游戏</button>
       </div>
     </div>

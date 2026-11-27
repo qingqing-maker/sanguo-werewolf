@@ -1,6 +1,6 @@
 import { GameEngine, HumanInputResult, PendingHumanInputSnapshot, SeatPrivateSnapshot } from '../game/GameEngine';
 import { RoleRegistry } from '../roles/RoleRegistry';
-import { createLLMProvider } from '../llm/ProviderFactory';
+import { createLLMProvider, getConfiguredModelName, getConfiguredProviderName } from '../llm/ProviderFactory';
 import { GameConfig, Difficulty } from '../types';
 import { EventPublisher, globalEventBus } from '../game/EventBus';
 
@@ -9,6 +9,7 @@ export type GameEngineFactory = (config: GameConfig) => GameEngine;
 /** 游戏流程控制器；所有开局/重开操作均通过单一活动代次串行。 */
 export class GameController {
   private engine: GameEngine | null = null;
+  private activeModel: { provider: string; model: string } | null = null;
   private isRunning = false;
   private currentGameId: string | null = null;
   private generation = 0;
@@ -54,9 +55,12 @@ export class GameController {
   private beginGame(config?: Partial<GameConfig>, onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, restartReserved = false): Promise<void> {
     if ((!restartReserved && this.restartPending) || this.activeRun || this.isRunning) return Promise.reject(new Error('GAME_BUSY'));
     const gameConfig = config ? { ...RoleRegistry.getDefaultConfig(), ...config } : RoleRegistry.getDefaultConfig();
+    const provider = getConfiguredProviderName();
+    const model = getConfiguredModelName(provider);
     const engine = this.engineFactory(gameConfig);
     const generation = ++this.generation;
     this.engine = engine;
+    this.activeModel = { provider, model };
     this.engine.setPresentationClientAvailable(this.presentationClientAvailable);
     this.currentGameId = engine.getGameId();
     this.isRunning = true;
@@ -68,6 +72,7 @@ export class GameController {
       if (this.generation === generation && this.engine === engine) {
         this.isRunning = false;
         this.engine = null;
+        this.activeModel = null;
         this.currentGameId = null;
         this.activeRun = null;
       }
@@ -145,11 +150,12 @@ export class GameController {
   } {
     const cfg = this.engine?.getConfig();
     const progress = this.engine?.getPhaseRound() ?? { phase: null, round: 0 };
+    const provider = this.activeModel?.provider ?? getConfiguredProviderName();
     return {
       isRunning: this.isRunning,
       paused: this.engine?.paused || false,
-      provider: process.env.LLM_PROVIDER || 'mock',
-      model: process.env.LLM_MODEL_ID || 'mock',
+      provider,
+      model: this.activeModel?.model ?? getConfiguredModelName(provider),
       gameId: this.currentGameId,
       phase: progress.phase,
       round: progress.round,

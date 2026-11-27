@@ -27,7 +27,7 @@ interface SpeechPayload {
 
 /** EventBus 当前实际发布的全部事件及其业务载荷。 */
 export interface GameEventPayloadMap {
-  game_start: { players: EventPlayerSnapshot[]; config: GameConfig };
+  game_start: { players: EventPlayerSnapshot[]; config: GameConfig; model?: string };
   game_paused: Record<string, never>;
   game_resumed: Record<string, never>;
   game_cancelled: Record<string, never>;

@@ -154,6 +154,26 @@ async function main(): Promise<void> {
   await abortRestart;
   assert.equal(abortController.getState().isRunning, false);
   assert.equal(abortController.getState().gameId, null);
+
+  const previousProvider = process.env.LLM_PROVIDER;
+  const previousModel = process.env.LLM_MODEL_ID;
+  try {
+    process.env.LLM_PROVIDER = 'volcengine';
+    process.env.LLM_MODEL_ID = 'first-model';
+    const modelEngine = createDeferredEngine('model-game');
+    const modelController = new GameController(() => modelEngine.engine);
+    const modelRun = modelController.startGame();
+    process.env.LLM_MODEL_ID = 'next-model';
+    assert.equal(modelController.getState().model, 'first-model', '改设置后，活动局仍应显示启动时的模型');
+    modelEngine.resolve();
+    await modelRun;
+    assert.equal(modelController.getState().model, 'next-model', '回到大厅应显示下一局的模型设置');
+  } finally {
+    if (previousProvider === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = previousProvider;
+    if (previousModel === undefined) delete process.env.LLM_MODEL_ID;
+    else process.env.LLM_MODEL_ID = previousModel;
+  }
   console.log('GameController 并发及 abort 驱动重开离线测试通过');
 }
 

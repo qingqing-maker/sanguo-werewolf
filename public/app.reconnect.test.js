@@ -24,7 +24,7 @@ class FakeElement {
     this.id = '';
     this.className = '';
     this.classList = new FakeClassList();
-    this.style = {};
+    this.style = { removeProperty(name) { delete this[name]; } };
     this.dataset = {};
     this.children = [];
     this.parentNode = null;
@@ -34,7 +34,10 @@ class FakeElement {
     this.checked = false;
     this.disabled = false;
     this.scrollTop = 0;
+    this.scrollLeft = 0;
     this.scrollHeight = 0;
+    this.clientHeight = 0;
+    this.clientTop = 0;
     this.listeners = {};
   }
   appendChild(child) {
@@ -50,6 +53,8 @@ class FakeElement {
     this.parentNode = null;
   }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  getBoundingClientRect() { return { top: 0, bottom: this.clientHeight }; }
+  querySelectorAll() { return []; }
   querySelector(selector) {
     if (selector === '.toast-close') return this.children[0] || new FakeElement('span', this.ownerDocument);
     if (selector === '.vote-container:last-child') {
@@ -88,8 +93,9 @@ class FakeDocument {
   }
 }
 
-function makeHarness() {
+function makeHarness(savedScroll = new Map()) {
   const document = new FakeDocument();
+  document.body.classList.add('lobby-view');
   const ids = [
     'humanInputPanel', 'inputOptions', 'inputPrompt', 'inputTextArea', 'humanTextInput',
     'modelInfo', 'btnStart', 'btnJoin', 'btnPause', 'btnResume', 'btnRestart', 'controlBtns',
@@ -108,6 +114,7 @@ function makeHarness() {
   const timers = [];
   const fetchCalls = [];
   const audioInstances = [];
+  const windowListeners = new Map();
   let pendingFetch = null;
 
   class FakeWebSocket {
@@ -143,13 +150,17 @@ function makeHarness() {
   const context = {
     console: { log() {}, warn() {}, error() {} },
     document,
+    history: { scrollRestoration: 'auto' },
+    confirm: () => true,
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    sessionStorage: { getItem: (key) => savedScroll.get(key) ?? null, setItem: (key, value) => savedScroll.set(key, value) },
     crypto: { getRandomValues: (array) => array.fill(1) },
     btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
     Uint8Array,
     EventSequence,
     WebSocket: FakeWebSocket,
     location: { protocol: 'http:', host: 'localhost:3000' },
+    URLSearchParams,
     setTimeout: (fn, delay) => { const timer = { fn, delay, active: true }; timers.push(timer); return timer; },
     clearTimeout: (timer) => { if (timer) timer.active = false; },
     requestAnimationFrame: (fn) => fn(),
@@ -176,13 +187,13 @@ function makeHarness() {
     Number,
     RegExp,
   };
-  context.window = { speechSynthesis, addEventListener() {} };
+  context.window = { speechSynthesis, addEventListener: (type, listener) => windowListeners.set(type, listener) };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8'), context, { filename: 'app.js' });
 
   const evaluate = (expression) => vm.runInContext(expression, context);
   return {
-    context, document, timers, fetchCalls, audioInstances, speechSynthesis,
+    context, document, timers, fetchCalls, audioInstances, speechSynthesis, windowListeners,
     sockets: FakeWebSocket.instances,
     evaluate,
     runNextTimer() {
@@ -216,7 +227,7 @@ function authenticated(data = {}) {
       sessionId: 's1', seatId: null,
       isHost: false, isPresentationClient: false, presentationToken: 'P'.repeat(43),
       room: { exists: true, roomId: 'room-1', isCreator: true },
-      capabilities: { createRoom: false, closeRoom: true, startGame: true, pauseGame: true, resumeGame: true, restartGame: true },
+      capabilities: { createRoom: false, closeRoom: true, startGame: true, pauseGame: true, resumeGame: true, cancelGame: true, restartGame: true },
       state: state(), stateSequence: 0, hasReplay: false, pendingInput: null, ...data,
     },
   };
@@ -322,19 +333,103 @@ async function main() {
   await check('公共回放结束明确退出活动局，重复 authenticated/connected 不重复恢复', async () => {
     const h = makeHarness();
     const socket = h.sockets[0]; socket.open();
-    socket.message(authenticated({ state: state(null, false), hasReplay: true }));
+    socket.message(authenticated({ state: state(null, false), hasReplay: true, replayGameId: 'old' }));
     const before = h.document.getElementById('dialogueArea').children.length;
     socket.message(authenticated({ state: state('should-ignore', true) }));
     assert.equal(h.evaluate('currentGameId'), null);
     socket.message({ type: 'connected', data: { message: 'legacy', state: state('legacy', true) } });
     assert.equal(h.evaluate('currentGameId'), null);
     socket.message({ type: 'replay_start', data: { gameId: 'old', count: 1 } });
-    socket.message({ type: 'player_speak', data: { gameId: 'old', playerId: 'p1', playerName: '诸葛亮', title: '卧龙', publicSpeech: '历史', innerThoughts: '', round: 1 }, sequence: 1 });
+    const timestamp = Date.UTC(2026, 10, 26, 8, 30, 0);
+    socket.message({ type: 'player_speak', data: { gameId: 'old', playerId: 'p1', playerName: '诸葛亮', title: '卧龙', publicSpeech: '历史', innerThoughts: '', round: 1 }, sequence: 1, timestamp });
     socket.message({ type: 'replay_end', data: { gameId: 'old' } });
     assert.equal(h.evaluate('replaying'), false);
     assert.equal(h.evaluate('gameStarted'), false);
     assert.equal(h.evaluate('currentGameId'), null);
+    const time = new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    assert.ok(logs(h).includes(`[${time}] 诸葛亮 发言`));
     assert.ok(h.document.getElementById('dialogueArea').children.length > before);
+  });
+
+  await check('结束对局返回大厅后刷新，整段历史回放不会盖掉大厅', () => {
+    const savedScroll = new Map();
+    const first = makeHarness(savedScroll);
+    first.sockets[0].open();
+    first.sockets[0].message(authenticated({ state: state('old', true) }));
+    first.evaluate('restartGame()');
+    assert.equal(first.sockets[0].sent.at(-1).type, 'cancel_game');
+    assert.equal(first.document.body.classList.contains('lobby-view'), false, '收到终止事件前保留对局');
+    first.sockets[0].message({ type: 'game_cancelled', data: { gameId: 'old' }, sequence: 1 });
+    assert.equal(first.document.body.classList.contains('lobby-view'), true);
+
+    const refreshed = makeHarness(savedScroll);
+    const socket = refreshed.sockets[0];
+    socket.open();
+    socket.message(authenticated({ state: state('old', false), hasReplay: true, replayGameId: 'old' }));
+    const replayStart = { type: 'game_start', sequence: 1, data: { gameId: 'old', players: state('old', true).players } };
+    socket.message({ type: 'replay_start', data: { gameId: 'old', count: 1 } });
+    socket.message(replayStart);
+    socket.message({ type: 'replay_end', data: { gameId: 'old' } });
+
+    assert.equal(refreshed.document.body.classList.contains('lobby-view'), true);
+    assert.equal(refreshed.document.getElementById('welcomePanel').style.display, undefined);
+    assert.equal(refreshed.evaluate('currentGameId'), null);
+    assert.equal(refreshed.evaluate('gameStarted'), false);
+    assert.equal(refreshed.evaluate('replaying'), false);
+    assert.ok(!logs(refreshed).some(entry => entry.includes('回放')));
+
+    socket.message({ ...replayStart, data: { ...replayStart.data, gameId: 'new' } });
+    assert.equal(refreshed.document.body.classList.contains('lobby-view'), false);
+    assert.equal(refreshed.evaluate('currentGameId'), 'new');
+  });
+
+  await check('直接打开大厅入口时，旧回放不接管页面', () => {
+    const h = makeHarness();
+    h.context.location.search = '?view=lobby';
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated({ hasReplay: true, replayGameId: 'old' }));
+    socket.message({ type: 'replay_start', data: { gameId: 'old', count: 1 } });
+    assert.equal(h.document.body.classList.contains('lobby-view'), true);
+    assert.equal(h.evaluate('replaying'), false);
+  });
+
+  await check('开局失败后可重试，等待结果期间只发送一次开局请求', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated());
+    h.evaluate('startGame(); startGameAsPlayer("曹操");');
+    assert.equal(socket.sent.filter(message => message.type === 'start_game').length, 1);
+    assert.equal(h.document.getElementById('btnStart').disabled, true);
+
+    socket.message({ type: 'error', data: { reason: 'rate_limited', retryAfterSeconds: 3 } });
+    assert.equal(h.document.getElementById('btnStart').disabled, false);
+    assert.match(h.document.getElementById('toastContainer').children.at(-1).innerHTML, /3 秒后重试/);
+    h.evaluate('startGameAsPlayer("曹操")');
+    assert.equal(socket.sent.at(-1).config.humanCharacterName, '曹操');
+  });
+
+  await check('回放按实际结局提示，隐藏暂停和继续', () => {
+    const cases = [
+      ['game_end', { winner: 'good', players: [] }, '本局已结算'],
+      ['game_cancelled', {}, '本局已提前结束'],
+      [null, {}, '本局记录止于中途'],
+    ];
+    for (const [type, data, expected] of cases) {
+      const h = makeHarness();
+      const socket = h.sockets[0];
+      socket.open();
+      socket.message(authenticated({ hasReplay: true, replayGameId: 'old' }));
+      socket.message({ type: 'replay_start', data: { gameId: 'old', count: 3 } });
+      socket.message({ type: 'game_start', data: { gameId: 'old', players: [] }, sequence: 1 });
+      if (type) socket.message({ type, data: { ...data, gameId: 'old' }, sequence: 2 });
+      socket.message({ type: 'replay_end', data: { gameId: 'old' } });
+      assert.equal(h.document.getElementById('stageTitle').textContent, '历史回放');
+      assert.equal(h.document.getElementById('btnPause').style.display, 'none');
+      assert.equal(h.document.getElementById('btnResume').style.display, 'none');
+      assert.ok(logs(h).some(line => line.includes(expected)));
+    }
   });
 
   await check('旧 gameId、重复和倒序 sequence 在 DOM/TTS 前被拒绝', async () => {
@@ -347,6 +442,29 @@ async function main() {
     socket.message(event); socket.message(event);
     socket.message({ ...event, sequence: 0 });
     assert.equal(h.document.getElementById('dialogueArea').children.length, before + 1);
+  });
+
+  await check('开局更新模型名，警长发言保留头像与真人标记', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated({ seatId: 'p1' }));
+    const player = { id: 'p1', name: '典韦', title: '古之恶来', roleType: 'villager', isAlive: true };
+    socket.message({ type: 'game_start', data: { gameId: 'g1', players: [player], model: 'new-model' }, sequence: 1 });
+    assert.equal(h.document.getElementById('modelInfo').textContent, '模型: new-model');
+
+    const speeches = [
+      { type: 'sheriff_speech', data: { playerId: 'p1', playerName: '典韦' }, name: '🏅 典韦' },
+      { type: 'sheriff_pk_speech', data: { playerId: 'p1', playerName: '典韦' }, name: '⚔️ 典韦' },
+      { type: 'sheriff_final_speech', data: { sheriffId: 'p1', sheriffName: '典韦' }, name: '🏅 警长典韦' },
+    ];
+    speeches.forEach(({ type, data, name }, index) => {
+      socket.message({ type, data: { ...data, gameId: 'g1', speech: '我是典韦。' }, sequence: index + 2 });
+      const [avatar, label, badge] = h.document.getElementById('dialogueArea').children.at(-1).children[0].children;
+      assert.equal(avatar.children[0].src, 'images/portraits/dian-wei.webp');
+      assert.equal(label.textContent, name);
+      assert.equal(badge.textContent, '你');
+    });
   });
 
   await check('下一名角色的文字等待上一段 TTS 播放结束后才显示', async () => {
@@ -421,6 +539,50 @@ async function main() {
     assert.equal(h.document.getElementById('dialogueArea').children.filter((child) => child.className === 'message').length, 2);
     h.speechSynthesis.utterances[0].onend();
     assert.equal(socket.sent.at(-1).data.sequence, 2);
+  });
+
+  await check('历史回放结束仍会保存位置，刷新同一局后恢复三个区域', () => {
+    const savedScroll = new Map();
+    const replay = (h, gameId) => {
+      const socket = h.sockets[0];
+      socket.open();
+      socket.message(authenticated({ hasReplay: true, replayGameId: gameId }));
+      socket.message({ type: 'replay_start', data: { gameId, count: 0 } });
+      socket.message({ type: 'replay_end', data: { gameId } });
+    };
+    const panes = ['dialogueArea', 'eventLog', 'playerList'];
+    const first = makeHarness(savedScroll);
+    replay(first, 'old');
+    for (const [index, id] of panes.entries()) {
+      Object.assign(first.document.getElementById(id), { scrollHeight: 600, clientHeight: 100, scrollTop: 120 + index });
+    }
+    first.document.getElementById('playerList').scrollLeft = 75;
+    first.windowListeners.get('pagehide')();
+
+    const reloaded = makeHarness(savedScroll);
+    replay(reloaded, 'old');
+    assert.deepEqual(panes.map(id => reloaded.document.getElementById(id).scrollTop), [120, 121, 122]);
+    assert.equal(reloaded.document.getElementById('playerList').scrollLeft, 75);
+
+    const differentGame = makeHarness(savedScroll);
+    replay(differentGame, 'different');
+    assert.deepEqual(panes.map(id => differentGame.document.getElementById(id).scrollTop), [0, 0, 0]);
+  });
+
+  await check('现场收到新发言时保留正在阅读的位置，位于底部时跟随', () => {
+    const h = makeHarness();
+    const socket = h.sockets[0];
+    socket.open();
+    socket.message(authenticated({ state: state('g1', true) }));
+    const dialogue = h.document.getElementById('dialogueArea');
+    const eventLog = h.document.getElementById('eventLog');
+    Object.assign(dialogue, { scrollHeight: 600, clientHeight: 100, scrollTop: 175 });
+    Object.assign(eventLog, { scrollHeight: 300, clientHeight: 100, scrollTop: 200 });
+    socket.message({ type:'player_speak', data: { gameId: 'g1', playerName: '诸葛亮', publicSpeech: '继续发言' }, sequence: 1 });
+    assert.equal(dialogue.scrollTop, 175);
+    assert.equal(dialogue.children.at(-1).dataset.eventSequence, '1');
+    assert.equal(eventLog.scrollTop, 300);
+    assert.equal(eventLog.children.at(-1).dataset.eventSequence, '1');
   });
 
   await check('replay_start 作废在途 TTS，回放对白静音，结束后实时对白恢复', async () => {
