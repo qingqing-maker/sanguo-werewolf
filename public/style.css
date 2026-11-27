@@ -116,6 +116,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
   transition: background-color .18s, border-color .18s, color .18s;
 }
 .btn-ctrl { min-height: 34px; padding: 4px 10px; font-size: .78rem; }
+.header-controls .btn-ctrl[hidden] { display: none; }
 .btn-start { min-height: 42px; padding: 8px 18px; font-size: .88rem; font-weight: 700; }
 .btn-start:not(.btn-back), .btn-mode-toggle {
   border-color: #be644d;

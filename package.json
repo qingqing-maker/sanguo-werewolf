@@ -1,6 +1,6 @@
 {
   "name": "sanguo-werewolf",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "description": "三国狼人杀 - 多智能体游戏框架",
   "main": "dist/index.js",
   "scripts": {
@@ -38,14 +38,15 @@
     "test:webserver": "ts-node src/server/WebServer.integration.test.ts",
     "test:tts": "ts-node src/tts/TTSService.test.ts",
     "test:tts-config": "ts-node src/tts/TTSFactory.test.ts",
-    "test:security": "npm run test:session && npm run test:protocol && npm run test:pending && npm run test:controller && npm run test:webserver && npm run test:checkpoint && npm run test:tts && npm run test:tts-config",
+    "test:security": "npm run test:session && npm run test:protocol && npm run test:pending && npm run test:controller && npm run test:webserver && npm run test:checkpoint && npm run test:rooms && npm run test:tts && npm run test:tts-config",
     "test:events": "npm run test:event-bus && npm run test:event-log && npm run test:visibility",
     "test": "npm run test:random && npm run test:json && npm run test:rules && npm run test:budget && npm run test:retry && npm run test:speech && npm run test:seer && npm run test:nameid && npm run test:roster && npm run test:player-content && npm run test:pacing && npm run test:phase-machine && npm run test:phase-seq && npm run test:difficulty && npm run test:sim-report && npm run test:mock-provider && npm run test:sim-pool && npm run test:fallback && npm run test:provider-signal && npm run test:events && npm run test:frontend && npm run test:security",
     "sim": "ts-node --transpile-only src/sim_pool.ts",
     "sim:report": "ts-node --transpile-only src/sim_report.ts",
     "budget:status": "ts-node --transpile-only src/budget_status.ts",
     "tts:budget:status": "ts-node --transpile-only src/tts_budget_status.ts",
-    "test:checkpoint": "ts-node src/server/GameCheckpoint.integration.test.ts"
+    "test:checkpoint": "ts-node src/server/GameCheckpoint.integration.test.ts",
+    "test:rooms": "ts-node src/server/RoomServer.integration.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

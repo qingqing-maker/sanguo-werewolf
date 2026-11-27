@@ -120,6 +120,12 @@ export class GameController {
     }
   }
 
+  async stopGame(): Promise<void> {
+    const running = this.activeRun;
+    this.cancelGame();
+    await running;
+  }
+
   handleHumanInput(gameId: string, requestId: string, seatId: string, input: Record<string, unknown>): HumanInputResult {
     if (!this.engine || !this.isRunning) return { accepted: false, reason: 'no_pending_input' };
     return this.engine.receiveHumanInput(gameId, requestId, seatId, input);

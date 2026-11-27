@@ -4,6 +4,7 @@ dotenv.config();
 import { GameEngine } from './game/GameEngine';
 import { RoleRegistry } from './roles/RoleRegistry';
 import { assertProviderConfiguration, createLLMProvider } from './llm/ProviderFactory';
+import { RoomServer } from './server/RoomServer';
 import { WebServer } from './server/WebServer';
 
 // 真实模式在服务/控制台启动前验证硬预算；配置缺失、账本损坏或遗留锁均拒绝启动。
@@ -29,8 +30,8 @@ async function runConsole() {
 
 function runWeb() {
   console.log('正在启动三国狼人杀 Web 服务...\n');
-  const server = new WebServer();
-  server.start();
+  const server = process.argv.includes('--single-room') ? new WebServer() : new RoomServer();
+  void server.start().catch(error => { console.error('Web 服务启动失败:', error); process.exitCode = 1; });
 }
 
 // 解析命令行参数

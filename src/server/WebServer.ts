@@ -1,6 +1,7 @@
 import express from 'express';
-import { createServer } from 'http';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { AddressInfo } from 'net';
+import { Duplex } from 'stream';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { randomBytes } from 'node:crypto';
@@ -9,7 +10,7 @@ import { GameUIEvent } from '../game/GameEvents';
 import { GameController } from './GameController';
 import { EventLog } from './EventLog';
 import { GameCheckpoint } from '../game/GameEngine';
-import { GameCheckpointCodec, MAX_CHECKPOINT_LENGTH } from './GameCheckpointCodec';
+import { createCheckpointCodec, GameCheckpointCodec, MAX_CHECKPOINT_LENGTH } from './GameCheckpointCodec';
 import { getTTSService } from '../tts/TTSServiceFactory';
 import { TTSService } from '../tts/TTSService';
 import { TTSErrorReason, TTSServiceError } from '../tts/TTSProvider';
@@ -43,6 +44,7 @@ export interface WebServerOptions {
   controlCooldownMs?: number;
   minorControlCooldownMs?: number;
   checkpointKey?: string;
+  gateway?: { roomId?: string; onRoomClosed?: () => void };
 }
 
 type CheckpointStatus = 'available' | 'restored' | 'invalid' | 'ended' | 'disabled' | 'unavailable';
@@ -53,7 +55,8 @@ const MAX_AUTHENTICATION_BYTES = MAX_CHECKPOINT_LENGTH + 512;
 export class WebServer {
   private readonly app = express();
   private readonly server = createServer(this.app);
-  private readonly wss = new WebSocketServer({ server: this.server, maxPayload: MAX_AUTHENTICATION_BYTES });
+  private readonly wss: WebSocketServer;
+  private readonly gateway: WebServerOptions['gateway'];
   private readonly clients = new Set<ConnectionContext>();
   private readonly gameController: GameController;
   private readonly eventLog: EventLog;
@@ -79,10 +82,12 @@ export class WebServer {
 
   constructor(options: WebServerOptions = {}) {
     this.port = options.port ?? parseInt(process.env.PORT || '3000', 10);
+    this.gateway = options.gateway;
+    this.wss = new WebSocketServer({
+      ...(this.gateway ? { noServer: true } : { server: this.server }), maxPayload: MAX_AUTHENTICATION_BYTES,
+    });
     this.eventBus = options.eventBus ?? new EventBus();
-    const fallbackKey = (process.env.LLM_API_KEY || process.env.OPENAI_API_KEY)?.trim();
-    const checkpointKey = options.checkpointKey ?? (process.env.GAME_SAVE_KEY?.trim() || fallbackKey);
-    if (checkpointKey) this.checkpointCodec = new GameCheckpointCodec(checkpointKey, options.checkpointKey === undefined ? fallbackKey : undefined);
+    this.checkpointCodec = createCheckpointCodec(options.checkpointKey);
     this.gameController = options.controller ?? new GameController(
       undefined,
       this.eventBus,
@@ -100,6 +105,28 @@ export class WebServer {
     this.setupWebSocket();
     this.unsubscribeEventBus = this.eventBus.onAll(event => this.handleGameEvent(event));
     this.heartbeatTimer = setInterval(() => this.checkConnections(), options.heartbeatIntervalMs ?? 10_000).unref();
+  }
+
+  handleHttp(request: IncomingMessage, response: ServerResponse): void {
+    this.app(request, response);
+  }
+
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.wss.handleUpgrade(request, socket, head, client => this.wss.emit('connection', client));
+  }
+
+  reserveRoom(token: string): boolean {
+    const roomId = this.gateway?.roomId;
+    const session = roomId && this.sessions.authenticate(token);
+    return !!session && this.sessions.createRoom(session, roomId) === 'created';
+  }
+
+  hasConnectedHost(): boolean {
+    return !!this.presentationConnectionId;
+  }
+
+  isGameRunning(): boolean {
+    return this.gameController.getState().isRunning;
   }
 
   private setupExpress(): void {
@@ -208,6 +235,8 @@ export class WebServer {
       }
     });
 
+    if (this.gateway) return; // 共享的模型、语音和预算配置由部署环境管理。
+
     this.app.get('/api/settings', hostOnly, (_req, res) => {
       try { res.json({ success: true, settings: readSettings() }); }
       catch (error: any) { res.status(500).json({ success: false, error: error.message }); }
@@ -295,6 +324,7 @@ export class WebServer {
       return;
     }
     if (command.type === 'create_room') {
+      if (this.gateway) { this.sendError(context, 'forbidden'); return; }
       const result = this.sessions.createRoom(session);
       if (result === 'created' || result === 'already_creator') {
         this.cancelHostRelease(session);
@@ -325,6 +355,7 @@ export class WebServer {
           capabilities: this.capabilities(session),
         });
         this.broadcastRoomState();
+        this.gateway?.onRoomClosed?.();
       } else {
         this.send(context, transportEvent('error', { reason: result }));
       }
@@ -367,20 +398,22 @@ export class WebServer {
     const session = this.sessions.authenticate(token);
     if (!session) { this.sendError(context, 'invalid_token'); context.ws.close(4002, 'invalid token'); return; }
     context.session = session;
-    const checkpointStatus = checkpoint ? this.tryRestoreCheckpoint(session, checkpoint, deferCheckpoint) : undefined;
+    const lobby = !!this.gateway && !this.gateway.roomId;
+    const checkpointStatus = checkpoint ? this.tryRestoreCheckpoint(session, checkpoint, deferCheckpoint || lobby) : undefined;
     if (this.sessions.isRoomCreator(session)) this.cancelHostRelease(session);
     this.reconcilePresentationClient(false);
     if (context.authTimer) { clearTimeout(context.authTimer); context.authTimer = null; }
     const state = this.gameController.getState();
     const viewer = this.viewerFor(session);
     const privateSnapshot = session.seatId ? this.gameController.getSeatPrivateSnapshot(session.seatId) : null;
-    const replay = state.isRunning || checkpointStatus === 'available' ? null : this.getPublicReplay();
+    const replay = lobby || state.isRunning || checkpointStatus === 'available' ? null : this.getPublicReplay();
     const publicTimeline = state.isRunning && state.gameId ? this.getActivePublicTimeline(state.gameId) : [];
     this.send(context, transportEvent('authenticated', {
       sessionId: session.sessionId,
       isHost: session.isHost,
       isPresentationClient: context.isPresentationClient,
       supportsPageVisibility: true,
+      ...(this.gateway ? { roomGateway: true } : {}),
       presentationToken: context.isPresentationClient ? this.presentationToken : null,
       seatId: session.seatId,
       room: this.roomStateFor(session),
@@ -414,11 +447,13 @@ export class WebServer {
     try {
       const value = this.checkpointCodec.seal({
         checkpoint,
+        ...(this.gateway?.roomId ? { roomId: this.gateway.roomId } : {}),
         timeline: this.eventLog.loadEvents(checkpoint.gameId),
         sequence: this.eventBus.getLatestSequence(checkpoint.gameId),
       }, owner.tokenHash);
       this.sendToSession(owner, transportEvent('game_checkpoint', {
         gameId: checkpoint.gameId, value, savedAt: Date.now(), phase: checkpoint.nextPhase,
+        ...(this.gateway?.roomId ? { roomId: this.gateway.roomId } : {}),
         round: checkpoint.state.round + (checkpoint.nextPhase === 'night' ? 1 : 0),
       }));
     } catch (error) {
@@ -431,6 +466,7 @@ export class WebServer {
     if (this.gameController.getState().isRunning || (this.sessions.hasRoom() && !session.isHost)) return undefined;
     const saved = this.checkpointCodec.open(value, session.tokenHash);
     if (!saved) return 'invalid';
+    if (this.gateway?.roomId && saved.roomId && saved.roomId !== this.gateway.roomId) return 'invalid';
     const { checkpoint, timeline, sequence } = saved;
     if (this.eventLog.loadEvents(checkpoint.gameId).some(event => event.type === 'game_end' || event.type === 'game_cancelled')) return 'ended';
     if (defer) return 'available';
@@ -513,7 +549,7 @@ export class WebServer {
     const pending = session.seatId ? this.gameController.getPendingHumanInput() : null;
     const state = this.gameController.getState();
     return {
-      createRoom: !this.sessions.hasRoom(),
+      createRoom: this.gateway ? !this.gateway.roomId : !this.sessions.hasRoom(),
       closeRoom: session.isHost,
       startGame: session.isHost, pauseGame: session.isHost, resumeGame: session.isHost,
       cancelGame: session.isHost, restartGame: session.isHost,
@@ -682,6 +718,7 @@ export class WebServer {
         this.controlTimestamps.delete(pending.sessionId);
         this.reconcilePresentationClient();
         this.broadcastRoomState();
+        this.gateway?.onRoomClosed?.();
         console.log('[WebServer] 主持人离线宽限期结束，已自动释放空闲房间');
       }
     }, this.hostDisconnectGraceMs);
@@ -779,6 +816,7 @@ export class WebServer {
   async stop(): Promise<void> {
     this.unsubscribeEventBus?.();
     this.unsubscribeEventBus = null;
+    const stoppingGame = this.gateway?.roomId ? this.gameController.stopGame() : undefined;
     this.cancelHostRelease();
     this.cancelHostPause();
     clearInterval(this.heartbeatTimer);
@@ -790,6 +828,7 @@ export class WebServer {
     await new Promise<void>(resolve => this.wss.close(() => resolve()));
     if (this.server.listening) await new Promise<void>((resolve, reject) => this.server.close(error => error ? reject(error) : resolve()));
     await this.eventLog.close();
+    await stoppingGame;
   }
 
   async dispose(): Promise<void> { await this.stop(); }
