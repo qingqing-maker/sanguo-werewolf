@@ -17,6 +17,7 @@ export class GameController {
   private generation = 0;
   private activeRun: Promise<void> | null = null;
   private restartPending = false;
+  private stopped = false;
   private presentationClientAvailable = false;
 
   private readonly engineFactory: GameEngineFactory;
@@ -44,19 +45,19 @@ export class GameController {
   }
 
   restoreGame(checkpoint: GameCheckpoint, onInitialized?: OnInitialized): Promise<void> {
-    if (this.restartPending || this.activeRun || this.isRunning) throw new Error('GAME_BUSY');
+    if (this.stopped || this.restartPending || this.activeRun || this.isRunning) throw new Error('GAME_BUSY');
     return this.runEngine(this.createEngine(checkpoint.config, checkpoint.gameId), onInitialized, checkpoint);
   }
 
   /** 启动新局；已有启动、运行或重开操作时明确拒绝，不做隐式取消。 */
   startGame(config?: Partial<GameConfig>, onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void): Promise<void> {
-    if (this.restartPending || this.activeRun || this.isRunning) throw new Error('GAME_BUSY');
+    if (this.stopped || this.restartPending || this.activeRun || this.isRunning) throw new Error('GAME_BUSY');
     return this.beginGame(config, onInitialized);
   }
 
   /** 安全重开：同步占位，先取消并等待旧引擎真实退出，再创建下一代。 */
   restartGame(config?: Partial<GameConfig>, onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void): Promise<void> {
-    if (this.restartPending) throw new Error('GAME_BUSY');
+    if (this.stopped || this.restartPending) throw new Error('GAME_BUSY');
     this.restartPending = true;
     const previous = this.activeRun;
     if (this.engine && this.currentGameId) {
@@ -73,7 +74,7 @@ export class GameController {
   }
 
   private beginGame(config?: Partial<GameConfig>, onInitialized?: (gameId: string, players: ReturnType<GameEngine['getPlayers']>) => void, restartReserved = false): Promise<void> {
-    if ((!restartReserved && this.restartPending) || this.activeRun || this.isRunning) return Promise.reject(new Error('GAME_BUSY'));
+    if (this.stopped || (!restartReserved && this.restartPending) || this.activeRun || this.isRunning) return Promise.reject(new Error('GAME_BUSY'));
     const gameConfig = config ? { ...RoleRegistry.getDefaultConfig(), ...config } : RoleRegistry.getDefaultConfig();
     return this.runEngine(this.engineFactory(gameConfig), onInitialized);
   }
@@ -121,6 +122,7 @@ export class GameController {
   }
 
   async stopGame(): Promise<void> {
+    this.stopped = true;
     const running = this.activeRun;
     this.cancelGame();
     await running;

@@ -711,7 +711,7 @@ function processEvent(msg) {
       if (msg.data.pendingInput && serverRunning) showHumanInputPanel(msg.data.pendingInput);
       handleCheckpointStatus(msg.data.checkpointStatus);
       if (requestedSave && msg.data.checkpointStatus === 'restored') resumeGame();
-      else if (requestedSave && !msg.data.checkpointStatus) showToast('暂时无法续局', '请确认房间空闲后重试。', 'warn');
+      else if (requestedSave && !serverRunning && !msg.data.checkpointStatus) showToast('暂时无法续局', '请确认房间空闲后重试。', 'warn');
       updateControlButtons();
       if (didReconnect) addLog('已重新连接到服务器', 'system');
       if (!hasReplay && !scrollViewReady) restoreScrollView(serverRunning ? state.gameId : null);
