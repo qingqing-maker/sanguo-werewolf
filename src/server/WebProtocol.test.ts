@@ -5,6 +5,8 @@ async function main(): Promise<void> {
   const token = 'A'.repeat(43);
   assert.deepEqual(decodeClientCommand({ type: 'authenticate', token }), { type: 'authenticate', token });
   assert.deepEqual(decodeClientCommand({ type: 'authenticate', token, checkpoint: 'v1.YWJj' }), { type: 'authenticate', token, checkpoint: 'v1.YWJj' });
+  const defer = { type: 'authenticate', token, checkpoint: 'v1.YWJj', deferCheckpoint: true };
+  assert.deepEqual(decodeClientCommand(defer), defer);
   assert.deepEqual(decodeClientCommand({ type: 'create_room' }), { type: 'create_room' });
   assert.deepEqual(decodeClientCommand({ type: 'close_room' }), { type: 'close_room' });
   assert.deepEqual(decodeClientCommand({ type: 'ping' }), { type: 'ping' });
@@ -22,6 +24,7 @@ async function main(): Promise<void> {
   const invalid = [
     null, [], { type: 'authenticate', token: 'short' }, { type: 'ping', extra: true },
     { type: 'authenticate', token, checkpoint: 'not-a-checkpoint' },
+    { type: 'authenticate', token, deferCheckpoint: true },
     { type: 'create_room', extra: true }, { type: 'close_room', extra: true },
     { type: 'join_game', playerId: 'player_1' }, { type: 'start_game', config: { operator: true } },
     { type: 'human_input', data: { gameId: '../bad', requestId: 'r', input: {} } },

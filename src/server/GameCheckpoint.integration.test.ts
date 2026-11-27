@@ -70,6 +70,9 @@ async function main(): Promise<void> {
       codec.open(message.data.value, tokenHash)?.checkpoint.nextPhase === PhaseNode.DAWN,
     );
     const saved = codec.open(checkpointMessage.data.value, tokenHash)!;
+    assert.equal(checkpointMessage.data.phase, 'dawn');
+    assert.equal(checkpointMessage.data.round, 1);
+    assert.ok(checkpointMessage.data.savedAt > 0);
     assert.equal(saved.checkpoint.state.round, 1);
     assert.ok(saved.checkpoint.state.nightActions.length > 0, '存档保留已完成的夜间行动');
     assert.ok(saved.checkpoint.agents.some(agent => agent.memory.length > 0), '存档保留 Agent 的私密记忆');
@@ -84,6 +87,13 @@ async function main(): Promise<void> {
     const denied = await wrongOwner.waitFor('authenticated');
     assert.equal(denied.data.checkpointStatus, 'invalid');
     assert.equal(denied.data.room.exists, false);
+
+    const lobby = await connect(port);
+    lobby.send({ type: 'authenticate', token: ownerToken, checkpoint: checkpointMessage.data.value, deferCheckpoint: true });
+    const available = (await lobby.waitFor('authenticated')).data;
+    assert.equal(available.checkpointStatus, 'available');
+    assert.equal(available.state.isRunning, false);
+    assert.equal(available.room.exists, false);
 
     const restored = await connect(port);
     restored.send({ type: 'authenticate', token: ownerToken, checkpoint: checkpointMessage.data.value });

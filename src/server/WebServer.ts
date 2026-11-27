@@ -41,7 +41,7 @@ export interface WebServerOptions {
   checkpointKey?: string;
 }
 
-type CheckpointStatus = 'restored' | 'invalid' | 'ended' | 'disabled' | 'unavailable';
+type CheckpointStatus = 'available' | 'restored' | 'invalid' | 'ended' | 'disabled' | 'unavailable';
 const MAX_COMMAND_BYTES = 32_768;
 const MAX_AUTHENTICATION_BYTES = MAX_CHECKPOINT_LENGTH + 512;
 
@@ -261,7 +261,7 @@ export class WebServer {
 
   private handleClientMessage(context: ConnectionContext, command: ClientCommand): void {
     if (command.type === 'ping') { this.send(context, transportEvent('pong', {})); return; }
-    if (command.type === 'authenticate') { this.authenticate(context, command.token, command.checkpoint); return; }
+    if (command.type === 'authenticate') { this.authenticate(context, command.token, command.checkpoint, command.deferCheckpoint); return; }
     if (!context.session) { this.sendError(context, 'authentication_required'); return; }
     const session = context.session;
     if (command.type === 'create_room') {
@@ -332,19 +332,19 @@ export class WebServer {
     }
   }
 
-  private authenticate(context: ConnectionContext, token: string, checkpoint?: string): void {
+  private authenticate(context: ConnectionContext, token: string, checkpoint?: string, deferCheckpoint = false): void {
     if (context.session) { this.sendError(context, 'invalid_message'); return; }
     const session = this.sessions.authenticate(token);
     if (!session) { this.sendError(context, 'invalid_token'); context.ws.close(4002, 'invalid token'); return; }
     context.session = session;
-    const checkpointStatus = checkpoint ? this.tryRestoreCheckpoint(session, checkpoint) : undefined;
+    const checkpointStatus = checkpoint ? this.tryRestoreCheckpoint(session, checkpoint, deferCheckpoint) : undefined;
     if (this.sessions.isRoomCreator(session)) this.cancelHostRelease(session);
     this.reconcilePresentationClient(false);
     if (context.authTimer) { clearTimeout(context.authTimer); context.authTimer = null; }
     const state = this.gameController.getState();
     const viewer = this.viewerFor(session);
     const privateSnapshot = session.seatId ? this.gameController.getSeatPrivateSnapshot(session.seatId) : null;
-    const replay = state.isRunning ? null : this.getPublicReplay();
+    const replay = state.isRunning || checkpointStatus === 'available' ? null : this.getPublicReplay();
     const publicTimeline = state.isRunning && state.gameId ? this.getActivePublicTimeline(state.gameId) : [];
     this.send(context, transportEvent('authenticated', {
       sessionId: session.sessionId,
@@ -386,19 +386,23 @@ export class WebServer {
         timeline: this.eventLog.loadEvents(checkpoint.gameId),
         sequence: this.eventBus.getLatestSequence(checkpoint.gameId),
       }, owner.tokenHash);
-      this.sendToSession(owner, transportEvent('game_checkpoint', { gameId: checkpoint.gameId, value }));
+      this.sendToSession(owner, transportEvent('game_checkpoint', {
+        gameId: checkpoint.gameId, value, savedAt: Date.now(), phase: checkpoint.nextPhase,
+        round: checkpoint.state.round + (checkpoint.nextPhase === 'night' ? 1 : 0),
+      }));
     } catch (error) {
       console.warn('[存档] 写入浏览器存档失败:', error instanceof Error ? error.message : String(error));
     }
   }
 
-  private tryRestoreCheckpoint(session: SessionRecord, value: string): CheckpointStatus | undefined {
+  private tryRestoreCheckpoint(session: SessionRecord, value: string, defer: boolean): CheckpointStatus | undefined {
     if (!this.checkpointCodec) return 'disabled';
     if (this.gameController.getState().isRunning || (this.sessions.hasRoom() && !session.isHost)) return undefined;
     const saved = this.checkpointCodec.open(value, session.tokenHash);
     if (!saved) return 'invalid';
     const { checkpoint, timeline, sequence } = saved;
     if (this.eventLog.loadEvents(checkpoint.gameId).some(event => event.type === 'game_end' || event.type === 'game_cancelled')) return 'ended';
+    if (defer) return 'available';
     try {
       let initialized = false;
       void this.gameController.restoreGame(checkpoint, gameId => {

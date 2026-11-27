@@ -1,6 +1,7 @@
 import { GameCheckpoint, GameEngine, HumanInputResult, PendingHumanInputSnapshot, SeatPrivateSnapshot } from '../game/GameEngine';
 import { RoleRegistry } from '../roles/RoleRegistry';
 import { createLLMProvider, getConfiguredModelName, getConfiguredProviderName } from '../llm/ProviderFactory';
+import type { LLMErrorKind } from '../llm/LLMProvider';
 import { GameConfig, Difficulty } from '../types';
 import { EventPublisher, globalEventBus } from '../game/EventBus';
 
@@ -31,12 +32,14 @@ export class GameController {
   }
 
   private createEngine(config: GameConfig, gameId?: string): GameEngine {
-    const llm = createLLMProvider(undefined, false, { eventBus: this.eventBus });
-    return new GameEngine(config, llm, {
+    const providerName = getConfiguredProviderName();
+    const createModel = () => createLLMProvider(providerName, false, { eventBus: this.eventBus, disableFallback: true });
+    return new GameEngine(config, createModel(), {
       eventBus: this.eventBus,
       presentationAckEnabled: true,
       onPhaseBoundary: this.onPhaseBoundary,
       idFactory: gameId ? () => gameId : undefined,
+      retryModel: providerName === 'mock' ? undefined : createModel,
     });
   }
 
@@ -164,7 +167,7 @@ export class GameController {
   }
 
   getState(): {
-    isRunning: boolean; paused: boolean; provider: string; model: string;
+    isRunning: boolean; paused: boolean; provider: string; model: string; modelFailure: LLMErrorKind | null;
     gameId: string | null; players: any[]; phase: string | null; round: number;
     aiDifficulty: Difficulty; humanCharacterName: string | null;
   } {
@@ -174,6 +177,7 @@ export class GameController {
     return {
       isRunning: this.isRunning,
       paused: this.engine?.paused || false,
+      modelFailure: this.engine?.modelFailure ?? null,
       provider,
       model: this.activeModel?.model ?? getConfiguredModelName(provider),
       gameId: this.currentGameId,

@@ -24,6 +24,9 @@ let ignoredReplayGameId = null;
 // transport 消息不参与；legacy 无 sequence 仍可播放，但无法保证去重。
 const eventSequenceGuard = EventSequence.createEventSequenceGuard();
 const GAME_CHECKPOINT_KEY = 'sanguo-game-checkpoint';
+let checkpointRequested = false;
+let modelFailure = null;
+let modelAlertToast = null;
 // 参战模式：欲加入时选定的人物名（发给后端 start_game.humanCharacterName）；观战模式为 null。
 let humanCharacterName = null;
 // 人类自己座位的 id。参战模式下开局时从 game_start 里带 roleType 的那个座位识别出来；观战模式为 null。
@@ -501,7 +504,10 @@ function connectWebSocket() {
     authenticated = false;
     const checkpoint = readGameCheckpoint()?.value;
     offeredCheckpoint = typeof checkpoint === 'string';
-    socket.send(JSON.stringify({ type: 'authenticate', token: sessionToken, ...(offeredCheckpoint ? { checkpoint } : {}) }));
+    socket.send(JSON.stringify({
+      type: 'authenticate', token: sessionToken,
+      ...(offeredCheckpoint ? { checkpoint, ...(!gameStarted && !checkpointRequested ? { deferCheckpoint: true } : {}) } : {}),
+    }));
     if (!hasLoggedDisconnect) {
       addLog('已连接到服务器', 'system');
     }
@@ -606,6 +612,8 @@ function processEvent(msg) {
       authenticatedGeneration = connectionGeneration;
       const wasReconnect = isReconnect;
       const believedGameRunning = gameStarted;
+      const requestedSave = checkpointRequested;
+      checkpointRequested = false;
       const didReconnect = wasReconnect && hasLoggedDisconnect;
       if (didReconnect) hasLoggedDisconnect = false;
       const state = msg.data.state || null;
@@ -617,7 +625,8 @@ function processEvent(msg) {
       const wasInLobby = returnToLobby || (savedView
         ? savedView.gameId === null
         : new URLSearchParams(location.search).get('view') === 'lobby');
-      ignoredReplayGameId = !serverRunning && wasInLobby ? msg.data.replayGameId || null : null;
+      ignoredReplayGameId = !serverRunning && (wasInLobby || (readGameCheckpoint() && !believedGameRunning))
+        ? msg.data.replayGameId || null : null;
       const hasReplay = !!msg.data.hasReplay && !ignoredReplayGameId;
       if (serverRunning || hasReplay) {
         saveScrollView();
@@ -644,7 +653,7 @@ function processEvent(msg) {
           restoreActiveTimeline(msg.data.publicTimeline, msg.data.pendingPresentationSequence, state);
           restorePrivateSnapshot(msg.data.privateSnapshot);
           addSystemMessage(msg.data.checkpointStatus === 'restored'
-            ? '📜 已恢复最近存档。点击「继续」接着玩。'
+            ? (requestedSave ? '📜 已恢复最近存档。' : '📜 已恢复最近存档。点击「继续」接着玩。')
             : '🔄 已连接服务器，以上为当前对局的完整公共时间线。');
         } else if (wasReconnect && believedGameRunning && !hasReplay) {
           onServerLostGame();
@@ -655,6 +664,8 @@ function processEvent(msg) {
       }
       if (msg.data.pendingInput && serverRunning) showHumanInputPanel(msg.data.pendingInput);
       handleCheckpointStatus(msg.data.checkpointStatus);
+      if (requestedSave && msg.data.checkpointStatus === 'restored') resumeGame();
+      else if (requestedSave && !msg.data.checkpointStatus) showToast('暂时无法续局', '请确认房间空闲后重试。', 'warn');
       updateControlButtons();
       if (didReconnect) addLog('已重新连接到服务器', 'system');
       if (!hasReplay && !scrollViewReady) restoreScrollView(serverRunning ? state.gameId : null);
@@ -701,6 +712,7 @@ function processEvent(msg) {
       if (isHost && !replaying && msg.data.gameId === currentGameId) {
         try { localStorage.setItem(GAME_CHECKPOINT_KEY, JSON.stringify(msg.data)); }
         catch (_) { showToast('未能保存对局', '浏览器存储不可用或已满。', 'warn'); }
+        updateCheckpointUI();
       }
       break;
     case 'phase_change':
@@ -802,18 +814,22 @@ function processEvent(msg) {
       break;
     case 'game_paused':
       gamePaused = true;
+      modelFailure = msg.data.modelFailure || null;
       pauseTtsPlayback();
       updateControlButtons();
-      addLog('游戏已暂停', 'system');
-      addSystemMessage('⏸ 游戏已暂停');
+      addLog(modelFailure ? '模型请求失败，对局暂停' : '游戏已暂停', 'system');
+      addSystemMessage(modelFailure ? '模型请求失败，对局暂停' : '⏸ 游戏已暂停');
       break;
     case 'game_resumed':
       gamePaused = false;
+      modelFailure = null;
+      clearModelToast();
       resumeTtsPlayback();
       updateControlButtons();
       addLog('游戏已继续', 'system');
       break;
     case 'game_cancelled':
+      clearModelToast();
       discardGameCheckpoint(eventGameId);
       clearPendingHumanInput();
       stopPendingTts();
@@ -865,6 +881,34 @@ function processEvent(msg) {
 function readGameCheckpoint() {
   try { return JSON.parse(localStorage.getItem(GAME_CHECKPOINT_KEY)); }
   catch (_) { return null; }
+}
+
+function continueSavedGame() {
+  if (!authenticated || gameStarted || checkpointRequested || !readGameCheckpoint()?.value) return;
+  if (roomState.exists && !roomState.isCreator) return;
+  checkpointRequested = true;
+  authenticated = false;
+  updateCheckpointUI();
+  ws?.close();
+  connectWebSocket();
+}
+
+function updateCheckpointUI() {
+  const save = readGameCheckpoint();
+  const stageNames = { night: '黑夜', dawn: '天亮', day: '白天', vote: '投票' };
+  const stage = stageNames[save?.phase];
+  const location = stage && Number.isSafeInteger(save.round) ? `第 ${save.round} 轮${stage}` : '';
+  const time = Number.isFinite(save?.savedAt) ? new Date(save.savedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+  const caption = [location ? `已保存到${location}` : '有一局存档', time].filter(Boolean).join(' · ');
+  const lobbySave = document.getElementById('lobbySave');
+  lobbySave.hidden = !save?.value || gameStarted || replaying;
+  document.getElementById('lobbySaveInfo').textContent = caption;
+  const resume = document.getElementById('btnContinueSaved');
+  resume.disabled = !authenticated || checkpointRequested || (roomState.exists && !roomState.isCreator);
+  resume.textContent = checkpointRequested ? '正在恢复…' : '继续上局';
+  const matchSave = document.getElementById('matchSaveStatus');
+  matchSave.hidden = !gameStarted || replaying || !isHost || !save?.value || save.gameId !== currentGameId;
+  matchSave.textContent = caption;
 }
 
 function discardGameCheckpoint(gameId) {
@@ -1036,6 +1080,21 @@ function enterGameView(title = '对局现场') {
   if (welcomePanel) welcomePanel.style.display = 'none';
 }
 
+function toggleMobilePanel(panel) {
+  const body = document.body.classList;
+  const openRoster = panel === 'roster' && !body.contains('show-mobile-roster');
+  const openEvents = panel === 'events' && !mySeatId && !body.contains('show-mobile-events');
+  body.toggle('show-mobile-roster', openRoster);
+  body.toggle('show-mobile-events', openEvents);
+  document.getElementById('btnMobileRoster').setAttribute('aria-expanded', String(openRoster));
+  document.getElementById('btnMobileLog').setAttribute('aria-expanded', String(openEvents));
+}
+
+function toggleMatchPause() {
+  if (gamePaused) resumeGame();
+  else pauseGame();
+}
+
 /**
  * 彻底停止并作废当前所有 TTS 活动。
  *
@@ -1082,6 +1141,10 @@ function stopPendingTts(showQueuedMessages = false, acknowledgeQueuedMessages = 
 function resetToWelcome() {
   gameStarted = false;
   gamePaused = false;
+  modelFailure = null;
+  clearModelToast();
+  resetClueBoard(null);
+  toggleMobilePanel();
   gameStartPending = false;
   gameCancelPending = false;
   players = [];
@@ -1437,12 +1500,26 @@ function updateControlButtons() {
   const live = gameStarted && !replaying;
   pauseBtn.style.display = live && !gamePaused && capabilities.pauseGame ? '' : 'none';
   resumeBtn.style.display = live && gamePaused && capabilities.resumeGame ? '' : 'none';
+  resumeBtn.textContent = modelFailure ? '重试 AI' : '继续';
   pauseBtn.disabled = resumeBtn.disabled = !authenticated || gameCancelPending;
   const inRecap = document.getElementById('gameEndModal').style.display === 'flex' || document.querySelector('#restartFloatBtn');
   restartBtn.style.display = (live && capabilities.cancelGame) || (!gameStarted && !replaying && !inRecap) ? '' : 'none';
   restartBtn.disabled = live && (!authenticated || gameCancelPending);
   restartBtn.textContent = gameCancelPending ? '正在结束…' : live ? '再来一局' : '返回大厅';
   restartBtn.title = live ? '结束当前对局并返回大厅' : '返回大厅';
+  const mobilePause = document.getElementById('btnMobilePause');
+  mobilePause.hidden = !live || !(gamePaused ? capabilities.resumeGame : capabilities.pauseGame);
+  mobilePause.textContent = gamePaused ? resumeBtn.textContent : '暂停';
+  mobilePause.disabled = resumeBtn.disabled;
+  document.getElementById('btnMobileLobby').hidden = live || replaying;
+  document.getElementById('btnMobileLog').hidden = !!mySeatId;
+  const notice = document.getElementById('modelRetryNotice');
+  notice.hidden = !live || !gamePaused || !modelFailure;
+  if (!notice.hidden) {
+    const detail = { authentication: '模型认证失败', billing: '模型额度不足', budget: '已达到调用预算', timeout: '模型请求超时', parse: '模型返回格式异常', empty: '模型返回为空' };
+    notice.textContent = `${detail[modelFailure] || '模型请求失败'}，对局已暂停。${isHost ? '可点击「重试 AI」。' : '等待主持人重试。'}`;
+  }
+  updateCheckpointUI();
   updateRoomControls();
 }
 
@@ -1549,6 +1626,7 @@ function submitHumanText(allowEmpty) {
 // 新客户端连上时按序补发，这里把它们当普通事件走一遍渲染流程，恢复"看到哪了"。
 // 回放期间静音 TTS（replaying=true），并显示横幅告知这是历史记录、非直播。
 function onReplayStart(data) {
+  resetClueBoard(data.gameId);
   saveScrollView();
   scrollViewReady = false;
   // 回放必须从头扫描历史来重建 cursor，不能沿用握手或此前实时流留下的进度。
@@ -1617,6 +1695,8 @@ function restoreRunningGame(state) {
   degradeSeen.clear();
   resetProviderFallbackBadge();
   currentGameId = state.gameId || null;
+  resetClueBoard(currentGameId);
+  modelFailure = state.modelFailure || null;
   gameStarted = true;
   gamePaused = !!state.paused;
   players = state.players;
@@ -1635,6 +1715,7 @@ function restoreRunningGame(state) {
 
 function applyAuthoritativeRunningState(state) {
   gamePaused = !!state.paused;
+  if (!state.modelFailure) clearModelToast();
   // 顶栏阶段/轮次：后端下发时才带 round/phase，缺失就等下一个 phase_change 事件覆盖。
   if (state.round) {
     const roundInfo = document.getElementById('roundInfo');
@@ -1744,11 +1825,14 @@ function onGameStart(data) {
   presentationSpeechBySequence.clear();
   queuedPresentationSequences.clear();
   currentGameId = data.gameId || null;
+  resetClueBoard(currentGameId);
   gameStartPending = false;
   gameCancelPending = false;
   scrollViewReady = false;
   gameStarted = true;
   gamePaused = false;
+  modelFailure = null;
+  clearModelToast();
   players = data.players;
   if (typeof data.model === 'string' || replaying) renderModelInfo(data.model);
 
@@ -1792,6 +1876,7 @@ function onGameStart(data) {
 }
 
 function onPhaseChange(data) {
+  clueRound = data.round || clueRound;
   const badge = document.getElementById('phaseBadge');
   const roundInfo = document.getElementById('roundInfo');
 
@@ -1903,6 +1988,7 @@ function onSheriffWithdraw(data) {
 }
 
 function onSheriffVote(data) {
+  recordClueVote(data, '警长票');
   addVoteMessage({
     voterName: data.voterName,
     targetName: data.targetName,
@@ -1958,6 +2044,7 @@ function onSheriffTransfer(data) {
 }
 
 function onPlayerVote(data) {
+  recordClueVote(data, '放逐票');
   addVoteMessage(data);
   addLog(`${data.voterName} → ${data.targetName}`, 'vote');
 }
@@ -1976,6 +2063,7 @@ function onPlayerEliminated(data) {
 }
 
 function onPlayerLastWords(data) {
+  recordClueSpeech(data.playerId, data.words, '遗言', clueRound);
   addSystemMessage(`📜 ${data.playerName} 遗言: "${data.words}"`);
   addLog(`${data.playerName} 遗言`, 'death');
 }
@@ -2090,7 +2178,11 @@ function renderPlayerList(playerData) {
   );
 
   for (const p of playerData) {
-    const card = document.createElement('div');
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.addEventListener('click', () => openPlayerClue(p.id));
+    card.title = `查看${p.name}的公开线索`;
+    card.dataset.mark = clueMarks[p.id] || '';
     card.className = 'player-card';
     card.id = `player-${p.id}`;
     // 有 roleType 才显示身份：观战模式所有座位都带；参战模式只有自己座位带（服务端遮罩）。
@@ -2133,6 +2225,103 @@ function markPlayerDead(playerId) {
   const card = document.getElementById(`player-${playerId}`);
   if (!card) return;
   card.classList.add('dead');
+}
+
+const CLUE_MARKS_KEY = 'sanguo-clue-marks';
+let clueGameId = null;
+let clueRound = 1;
+let cluePerson = null;
+let clueRows = new Map();
+let clueMarks = {};
+
+function resetClueBoard(gameId) {
+  const dialog = document.getElementById('clueDialog');
+  if (dialog.open && gameId !== clueGameId) dialog.close();
+  if (gameId !== clueGameId) cluePerson = null;
+  clueGameId = gameId;
+  clueRound = 1;
+  clueRows = new Map();
+  clueMarks = {};
+  if (!gameId) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(CLUE_MARKS_KEY));
+    if (saved?.gameId === gameId && saved.marks) clueMarks = saved.marks;
+  } catch (_) { /* 浏览器可能限制存储。 */ }
+}
+
+function addPublicClue(playerId, round, label, text) {
+  if (!clueGameId || !playerId || !text) return;
+  const rows = clueRows.get(playerId) || [];
+  rows.push({ round, label, text });
+  clueRows.set(playerId, rows);
+  if (cluePerson === playerId && document.getElementById('clueDialog').open) renderPlayerClues();
+}
+
+function recordClueVote(data, label) {
+  addPublicClue(data.voterId, clueRound, label, `投给 ${data.targetName}`);
+}
+
+function recordClueSpeech(playerId, text, label, round) {
+  const speaker = players.find(player => player.id === playerId);
+  if (!speaker || !text) return;
+  const claim = text.match(/(?:^|[，。！？；：\s])(?:我|在下|末将|老夫|俺(?:老张)?|本将|[亮操瑜云备布羽韦])(?:便|正|就|才|确实)?是(?:真正的?|这局的?|本局的?)?(预言家|军师|女巫|神医|守卫|禁卫|猎人|猛将|平民)(?=$|[，。！？；：、\s])/);
+  addPublicClue(playerId, round, claim ? `自称${claim[1]} · ${label}` : label, text);
+  for (const target of players) {
+    if (target.id === playerId) continue;
+    const suspect = new RegExp(`(?:怀疑|质疑|最可疑的是|要投|打算投|先投|像狼的是)\\s*${target.name}|(?:^|[，。！？；：\\s])${target.name}(?:最可疑|很可疑|像狼|是狼)`);
+    if (suspect.test(text)) addPublicClue(target.id, round, `受到${speaker.name}质疑`, text);
+  }
+}
+
+function openPlayerClue(playerId) {
+  if (!clueGameId || !players.some(player => player.id === playerId)) return;
+  cluePerson = playerId;
+  renderPlayerClues();
+  const dialog = document.getElementById('clueDialog');
+  if (!dialog.open) dialog.showModal();
+}
+
+function renderPlayerClues() {
+  const player = players.find(candidate => candidate.id === cluePerson);
+  if (!player) return;
+  const heading = document.getElementById('cluePlayer');
+  heading.textContent = '';
+  const title = document.createElement('h2');
+  title.textContent = `${player.name} · 公开线索`;
+  heading.append(createCharacterAvatar(player.name), title);
+  const mark = clueMarks[cluePerson] || '';
+  for (const button of document.getElementById('clueDialog').querySelectorAll('[data-mark]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.mark === mark));
+  }
+  const list = document.getElementById('clueList');
+  list.textContent = '';
+  const rows = clueRows.get(cluePerson);
+  if (!rows?.length) {
+    const empty = document.createElement('p');
+    empty.textContent = '这名人物暂时没有公开发言或投票记录。';
+    list.appendChild(empty);
+    return;
+  }
+  for (const row of rows.slice().reverse()) {
+    const entry = document.createElement('article');
+    const meta = document.createElement('h3');
+    meta.textContent = `第 ${row.round} 轮 · ${row.label}`;
+    const quote = document.createElement('p');
+    quote.textContent = row.text;
+    entry.append(meta, quote);
+    list.appendChild(entry);
+  }
+}
+
+function setClueMark(mark) {
+  if (!clueGameId || !cluePerson || !['', 'suspect', 'trust'].includes(mark)) return;
+  if (mark) clueMarks[cluePerson] = mark;
+  else delete clueMarks[cluePerson];
+  try { localStorage.setItem(CLUE_MARKS_KEY, JSON.stringify({ gameId: clueGameId, marks: clueMarks })); }
+  catch (_) { /* 当前页仍可使用标记。 */ }
+  const card = document.getElementById(`player-${cluePerson}`);
+  if (card) card.dataset.mark = mark;
+  renderPlayerClues();
 }
 
 function revealAllRoles(playerData) {
@@ -2183,6 +2372,12 @@ function showToast(title, body, level = 'info', duration = 6000) {
   // 触发进入动画
   requestAnimationFrame(() => toast.classList.add('show'));
   if (duration > 0) setTimeout(close, duration);
+  return toast;
+}
+
+function clearModelToast() {
+  modelAlertToast?.remove();
+  modelAlertToast = null;
 }
 
 // LLM 熔断告警：后端因欠费/额度受限或预算耗尽停止调用 AI 时，弹长驻 Toast 让玩家知情。
@@ -2202,13 +2397,17 @@ function onLlmAlert(data) {
     body = 'API 余额不足或调用受限（欠费/额度耗尽），AI 已停止调用以防继续扣费。请检查账户后重启服务。';
   }
   // duration=0：不自动消失，需玩家手动关闭，确保这类关键告警不被错过。
-  showToast(title, body, 'error', 0);
+  if (!activeTimelineRestoring) {
+    clearModelToast();
+    modelAlertToast = showToast(title, body, 'error', 0);
+  }
   addSystemMessage(`⚠️ ${title}`);
   addLog(`LLM 熔断: ${data?.reason || kind}`, 'system');
 }
 
 function addSpeechMessage(data, logText = '', sequence) {
   const timestamp = timelineTimestamp;
+  const speechRound = data.round || clueRound;
   const showMessage = () => {
     const area = document.getElementById('dialogueArea');
     const div = document.createElement('div');
@@ -2226,7 +2425,13 @@ function addSpeechMessage(data, logText = '', sequence) {
     const title = document.createElement('span');
     title.className = 'message-title';
     title.textContent = String(data.title ?? '');
-    header.append(createCharacterAvatar(data.playerName), name, badge, title);
+    const clueButton = document.createElement('button');
+    clueButton.type = 'button';
+    clueButton.className = 'speech-clue-button';
+    clueButton.setAttribute('aria-label', `查看${data.playerName}的公开线索`);
+    clueButton.addEventListener('click', () => openPlayerClue(data.playerId));
+    clueButton.appendChild(createCharacterAvatar(data.playerName));
+    header.append(clueButton, name, badge, title);
     div.appendChild(header);
     const thoughts = String(data.innerThoughts || '').trim();
     if (thoughts) {
@@ -2238,6 +2443,7 @@ function addSpeechMessage(data, logText = '', sequence) {
     const speech = document.createElement('div');
     speech.className = 'message-bubble';
     speech.textContent = String(data.publicSpeech ?? '');
+    recordClueSpeech(data.playerId, speech.textContent, data.title || '发言', speechRound);
     div.appendChild(speech);
     appendTimelineEntry(area, div, sequence);
     if (logText) addLog(logText, 'speech', sequence, timestamp);

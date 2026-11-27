@@ -659,6 +659,7 @@ export class PhaseManager {
     }
 
     const context = `${deathNotice}\n请分析谁最可疑，给出你的判断。`;
+    let previousSpeech: { name: string; text: string } | undefined;
 
     // 非警长玩家依次发言
     for (const agent of aliveAgents) {
@@ -680,8 +681,9 @@ export class PhaseManager {
         );
         speech = { innerThoughts: '（人类玩家）', publicSpeech: input.speech || '...' };
       } else {
-        speech = await agent.speak(context, this.state);
+        speech = await agent.speak(context, this.state, previousSpeech);
       }
+      previousSpeech = { name: agent.player.name, text: speech.publicSpeech };
 
       console.log(`  │ 💭 [内心] ${speech.innerThoughts}`);
       console.log(`  │`);
@@ -725,7 +727,7 @@ export class PhaseManager {
           speech = { innerThoughts: '（人类玩家）', publicSpeech: input.speech || '...' };
         } else {
           const sheriffContext = `${deathNotice}\n你是警长，所有人已经发言完毕。请总结大家的发言，分析谁最可疑，引导投票方向。你的发言将影响接下来的投票。`;
-          speech = await sheriffAgent.speak(sheriffContext, this.state);
+          speech = await sheriffAgent.speak(sheriffContext, this.state, previousSpeech);
         }
 
         console.log(`  │ 💭 [内心] ${speech.innerThoughts}`);
@@ -962,6 +964,7 @@ export class PhaseManager {
     // 收集每位候选人的演说原文，用于投票阶段给 AI 看真实上下文（否则 AI 只知道候选人名字，
     // 完全不知道谁说了什么、谁跳了预言家、谁公开攻击了谁，投票就退化成随机猜）。
     const speechesByCandidate = new Map<string, string>();
+    let previousCandidate: { name: string; text: string } | undefined;
 
     for (const agent of candidates) {
       await this.engine.checkpoint();
@@ -1014,9 +1017,10 @@ export class PhaseManager {
         speech = input.speech || '竞选警长';
       } else {
         const context = '警长竞选演说环节。你需要说服警下玩家把警徽投给你。请在发言中展示你的分析能力、明确表态、暗示（但不必直接暴露）你的身份价值。演说不要泄漏机密（如具体验人结果，除非你决定跳预言家）。';
-        const result = await agent.speak(context, this.state);
+        const result = await agent.speak(context, this.state, previousCandidate);
         speech = result.publicSpeech;
       }
+      previousCandidate = { name: agent.player.name, text: speech };
 
       console.log(`  🏅 ${agent.player.name}：${speech.substring(0, 100)}${speech.length > 100 ? '...' : ''}`);
       speechesByCandidate.set(agent.player.id, speech);

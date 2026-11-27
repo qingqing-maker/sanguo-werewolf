@@ -33,15 +33,18 @@
     <!-- 主内容区 -->
     <main class="main">
       <!-- 左侧角色面板 -->
-      <aside class="panel-left">
-        <h2 class="panel-title">人物名册</h2>
+      <aside class="panel-left" id="rosterPanel">
+        <h2 class="panel-title panel-mobile-heading">人物名册<button class="btn-ctrl mobile-panel-close" type="button" onclick="toggleMobilePanel()">收起</button></h2>
         <div class="player-list" id="playerList"></div>
         <div class="model-info" id="modelInfo"></div>
       </aside>
 
       <!-- 中央对话区 -->
       <section class="center-stage">
-        <h2 class="panel-title stage-title" id="stageTitle">对局现场</h2>
+        <div class="stage-heading">
+          <h2 class="panel-title stage-title" id="stageTitle">对局现场</h2>
+          <small id="matchSaveStatus" class="match-save-status" hidden></small>
+        </div>
         <div class="dialogue-area" id="dialogueArea">
           <div class="welcome-message" id="welcomePanel">
             <div class="welcome-hero">
@@ -52,6 +55,10 @@
               </div>
             </div>
             <div class="lobby-card">
+              <section class="lobby-save" id="lobbySave" hidden>
+                <p id="lobbySaveInfo"></p>
+                <button type="button" class="btn-start" id="btnContinueSaved" onclick="continueSavedGame()">继续上局</button>
+              </section>
               <h3>对局设置</h3>
               <fieldset class="difficulty-bar" id="aiDifficultyBar">
                 <legend class="difficulty-label">AI 思考强度</legend>
@@ -92,6 +99,7 @@
             </div>
           </div>
         </div>
+        <div class="model-retry-notice" id="modelRetryNotice" role="status" hidden></div>
 
         <!-- 人类玩家操作面板 -->
         <div class="human-input-panel" id="humanInputPanel" style="display:none">
@@ -102,11 +110,17 @@
             <button class="btn-start" onclick="submitHumanText()">发送</button>
           </div>
         </div>
+        <nav class="match-dock" aria-label="对局操作">
+          <button class="btn-ctrl" id="btnMobileRoster" type="button" aria-controls="rosterPanel" aria-expanded="false" onclick="toggleMobilePanel('roster')">人物名册</button>
+          <button class="btn-ctrl" id="btnMobileLog" type="button" aria-controls="eventsPanel" aria-expanded="false" onclick="toggleMobilePanel('events')">事件日志</button>
+          <button class="btn-ctrl" id="btnMobilePause" type="button" onclick="toggleMatchPause()" hidden>暂停</button>
+          <button class="btn-ctrl" id="btnMobileLobby" type="button" onclick="restartGame()" hidden>返回大厅</button>
+        </nav>
       </section>
 
       <!-- 右侧信息栏 -->
-      <aside class="panel-right">
-        <h2 class="panel-title">事件日志</h2>
+      <aside class="panel-right" id="eventsPanel">
+        <h2 class="panel-title panel-mobile-heading">事件日志<button class="btn-ctrl mobile-panel-close" type="button" onclick="toggleMobilePanel()">收起</button></h2>
         <div class="event-log" id="eventLog">
           <div class="log-entry log-system">等待连接服务器...</div>
         </div>
@@ -116,6 +130,19 @@
 
   <!-- Toast 通知容器（右上角，用于 LLM 欠费/额度受限等提醒） -->
   <div id="toastContainer" class="toast-container"></div>
+
+  <dialog id="clueDialog" class="clue-dialog" aria-labelledby="cluePlayer">
+    <div class="clue-heading">
+      <div id="cluePlayer"></div>
+      <form method="dialog"><button type="submit" class="btn-ctrl">关闭</button></form>
+    </div>
+    <div class="clue-marks" aria-label="我的标记">
+      <button type="button" class="btn-ctrl" data-mark="" onclick="setClueMark('')">未标记</button>
+      <button type="button" class="btn-ctrl" data-mark="suspect" onclick="setClueMark('suspect')">可疑</button>
+      <button type="button" class="btn-ctrl" data-mark="trust" onclick="setClueMark('trust')">暂信</button>
+    </div>
+    <div id="clueList" class="clue-list"></div>
+  </dialog>
 
   <!-- 游戏结束弹窗 -->
   <div class="modal-overlay" id="gameEndModal" style="display:none">

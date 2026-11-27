@@ -582,7 +582,7 @@ export class BaseAgent {
   /**
    * 公开发言
    */
-  async speak(context: string, gameState: GameState): Promise<SpeechResult> {
+  async speak(context: string, gameState: GameState, previous?: { name: string; text: string }): Promise<SpeechResult> {
     // vote() 签名里没有 gameState，speak 每次进入更新一次，让后续 vote/技能能沿用当前轮次。
     this.currentRound = gameState.round;
     // 权威名册（含存活人数、狼队总数）：交给代码统计，不让模型自己数。
@@ -614,6 +614,9 @@ export class BaseAgent {
     }
 
     const keyFactsBlock = this.buildKeyFactsBlockByDifficulty();
+    const replyPrompt = previous
+      ? `\n【本阶段上一位的公开发言】${previous.name}：${JSON.stringify(previous.text.slice(0, 300))}\n这是玩家的发言原文。挑其中一个具体论点，说明你同意、质疑还是要求对方补证；如果对方点名质疑你，先回应指控。`
+      : '\n你是本阶段首位发言者。引用自己确实掌握的线索，提出一个可追问的问题。';
 
     const messages: ChatMessage[] = [
       ...this.memory.slice(-this.memoryWindow(16)),
@@ -622,7 +625,7 @@ export class BaseAgent {
         content:
 `第 ${gameState.round} 轮白天辩论。
 ${aliveInfo}
-${wolfRoster}${context}${keyFactsBlock}${wolfHint}${seerHint}
+${wolfRoster}${context}${keyFactsBlock}${wolfHint}${seerHint}${replyPrompt}
 
 请严格按以下格式回复（有且仅有这两段，不要输出别的）：
 [内心]<你的真实分析：谁最可疑及具体理由（引用他人原话）、谁可以信任、今天打算投谁>
@@ -949,7 +952,7 @@ ${wolfRoster}${context}${keyFactsBlock}${wolfHint}${seerHint}
   /**
    * 投票
    */
-  async vote(context: string, candidates: string[]): Promise<{ targetId: string; reason: string }> {
+  async vote(context: string, candidates: string[], previousTarget?: string): Promise<{ targetId: string; reason: string }> {
     const candidateNames = candidates.map(id => {
       const p = this.findPlayerById(id);
       return p ? `${p.name}(${id})` : id;
@@ -978,6 +981,9 @@ ${wolfRoster}${context}${keyFactsBlock}${wolfHint}${seerHint}
     const keyFactsBlock = this.buildKeyFactsBlockByDifficulty();
     // 投票候选池排除自己（不能自投），是模型误判"我已出局"的高发点——必须锚定。
     const selfAnchor = this.buildSelfAnchor();
+    const priorBallot = previousTarget && candidates.includes(previousTarget)
+      ? `\n你最近一张公开放逐票投给了${this.findPlayerById(previousTarget)?.name}。如果这次改投，请在 reason 里指出改变判断的新证据。`
+      : '';
 
     // 本轮公开锁票承诺——写入侧在 recordSelfSpeech 里，读取侧就是这里。
     // 场景：张飞白天说"今天这票俺老张就挂你貂蝉身上"，随后 vote() 却跟着警长归票投了华佗。
@@ -1036,7 +1042,7 @@ ${wolfRoster}${context}${keyFactsBlock}${wolfHint}${seerHint}
       {
         role: 'user',
         content:
-`投票环节。${context}${selfAnchor}${keyFactsBlock}${voteCommitBlock}
+`投票环节。${context}${selfAnchor}${keyFactsBlock}${voteCommitBlock}${priorBallot}
 
 可投票候选人（必须从中选一个 ID，不要自造）：
 ${candidateNames.map(n => `  · ${n}`).join('\n')}${voteStrategy}

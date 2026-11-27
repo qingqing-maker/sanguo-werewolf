@@ -5,7 +5,7 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_INPUT_JSON = 16_384;
 
 export type ClientCommand =
-  | { type: 'authenticate'; token: string; checkpoint?: string }
+  | { type: 'authenticate'; token: string; checkpoint?: string; deferCheckpoint?: boolean }
   | { type: 'create_room' | 'close_room' }
   | { type: 'ping' }
   | { type: 'start_game'; config?: Record<string, unknown> }
@@ -75,10 +75,15 @@ export function decodeClientCommand(value: unknown): ClientCommand | null {
   if (!isPlainObject(value) || typeof value.type !== 'string') return null;
   switch (value.type) {
     case 'authenticate':
-      if (!exactKeys(value, ['type', 'token', 'checkpoint'], ['type', 'token'])
+      if (!exactKeys(value, ['type', 'token', 'checkpoint', 'deferCheckpoint'], ['type', 'token'])
         || typeof value.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.token)
-        || (value.checkpoint !== undefined && !isCheckpointToken(value.checkpoint))) return null;
-      return { type: 'authenticate', token: value.token, ...(value.checkpoint === undefined ? {} : { checkpoint: value.checkpoint }) };
+        || (value.checkpoint !== undefined && !isCheckpointToken(value.checkpoint))
+        || (value.deferCheckpoint !== undefined && (typeof value.deferCheckpoint !== 'boolean' || !value.checkpoint))) return null;
+      return {
+        type: 'authenticate', token: value.token,
+        ...(value.checkpoint === undefined ? {} : { checkpoint: value.checkpoint }),
+        ...(value.deferCheckpoint === undefined ? {} : { deferCheckpoint: value.deferCheckpoint }),
+      };
     case 'create_room': case 'close_room':
       return exactKeys(value, ['type'], ['type']) ? { type: value.type } : null;
     case 'ping':

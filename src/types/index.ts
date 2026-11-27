@@ -94,6 +94,7 @@ export interface GameState {
   witchPoisonUsed: boolean; // 女巫毒药是否已使用
   lastGuardTarget: string | null; // 守卫上轮守护目标（不能连续守同一人）
   sheriffId: string | null;       // 当前警长ID
+  latestExileVotes?: Record<string, string>; // 每名玩家最近一次公开放逐票
 }
 
 /** 夜晚行动 */
